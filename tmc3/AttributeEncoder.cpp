@@ -723,6 +723,73 @@ AttributeEncoder::computeColorPredictionWeights(
   }
 }
 
+double
+AttributeEncoder::var_(std::vector<double>& val, int64_t len)
+{
+  double sum = 0;
+  double variance = 0;
+  double mean = 0;
+  double stdDeviation = 0;
+  double skeness = 0;
+  double x = 0;
+  double x1 = 0;
+  //  double niu3 = 0;
+  for (int i = 0; i < len; i++) {
+    sum = sum + val[i];
+    //  niu3 = niu3 +pow( val[i] , 3);
+  }
+  mean = sum / len;
+  // niu3 = niu3 / len;
+  for (int i = 0; i < len; i++)
+    variance = variance + pow(val[i] - mean, 2);
+  x = variance / len;
+  stdDeviation = sqrt(x);
+  double var1 = 0;
+  for (int i = 0; i < len; i++)
+    var1 = var1 + pow(val[i] - mean, 3);
+  //  int c = pow(8,1.0/3.0);
+  x1 = var1 / len;
+  double x2 = pow(stdDeviation, 3);
+  skeness = x1 / x2;
+  // skeness = pow(x2, 1.0/ 3.0);
+
+  return stdDeviation;
+  //return skeness;
+}
+//----------------------------------------------------------------------------
+double
+AttributeEncoder::c_variance(
+  PCCPointSet3& pointCloud, int64_t pointCount1, int64_t pointCount2, int i)
+{
+  // const size_t pointCount = pointCloud.getPointCount();
+  std::vector<double_t> color_lod_r;
+  color_lod_r.resize(pointCount2);
+  std::vector<double_t> color_lod_g;
+  color_lod_g.resize(pointCount2);
+  std::vector<double_t> color_lod_b;
+  color_lod_b.resize(pointCount2);
+  std::vector<Vec3<attr_t>> color_lod;
+  // int r[3];
+  color_lod.resize(pointCount2);
+
+  for (int predictorIndex_1 = pointCount1; predictorIndex_1 < pointCount2;
+       ++predictorIndex_1) {
+    color_lod[predictorIndex_1] =
+      pointCloud.getColor(_lods.indexes[predictorIndex_1]);
+    /* color_lod[predictorIndex_1] =
+      pointCloud.getColor(predictorIndex_1);*/
+    color_lod_r[predictorIndex_1] = color_lod[predictorIndex_1][i];
+    // color_lod_g[predictorIndex_1] = color_lod[predictorIndex_1][1];
+    /*  color_lod_b[predictorIndex_1] = 0.587*color_lod[predictorIndex_1][0]
+      + 0.144*color_lod[predictorIndex_1][1] + 0.299*color_lod[predictorIndex_1][2];*/
+    //  std::cout << color_lod_r[predictorIndex_1] << "\n";
+  }
+  // r[0] = var_(color_lod_r, pointCount);
+  // r[1] = var_(color_lod_g, pointCount);
+  //r[2] = var_(color_lod_b, pointCount);
+  double r1 = var_(color_lod_r, pointCount2 - pointCount1);
+  return r1;
+}
 //----------------------------------------------------------------------------
 
 void
@@ -741,13 +808,49 @@ AttributeEncoder::encodeColorsPred(
 
   int32_t values[3];
   PCCResidualsEntropyEstimator context;
+  std::vector<double> P[3];
+  for (int i = 0; i < 3; i++) {
+    P[i].resize(pointCount + 1);
+  }
+  std::vector<Vec3<attr_t>> flag_var;
+  // int r[3];
+  flag_var.resize(12);
+  Vec3<attr_t> realColor = 0;
   int zero_cnt = 0;
   std::vector<int> zerorun;
   std::vector<int32_t> residual[3];
   for (int i = 0; i < 3; i++) {
     residual[i].resize(pointCount);
   }
+  Vec3<attr_t> reconstructedColor;
+  std::vector<Vec3<attr_t>> color_real;
+  color_real.resize(_lods.numPointsInLod[6]);
   int quantLayer = 0;
+  //////////////////////////////////////////////////////////////////////////
+  int I = 6;
+  int64_t A = _lods.numPointsInLod[6];
+  int u = 0;
+  int j = 0;
+  int uu = 0;
+
+  if (_lods.numPointsInLod[3] - _lods.numPointsInLod[2] < 8) {
+    u = 3;
+  } else {
+    if (_lods.numPointsInLod[2] - _lods.numPointsInLod[1] < 8) {
+      u = 2;
+    } else {
+      u = 1;
+    }
+  }
+  int t = u;
+  if (
+    c_variance(pointCloud, 1, _lods.numPointsInLod[6], 2) <= 65
+    && c_variance(pointCloud, 1, _lods.numPointsInLod[6], 1) <= 65
+    && c_variance(pointCloud, 1, _lods.numPointsInLod[6], 0) <= 65) {
+    flag_var[I - 6][2] = 1;
+    flag_var[I - 6][1] = 1;
+    flag_var[I - 6][0] = 1;
+  }
   for (size_t predictorIndex = 0; predictorIndex < pointCount;
        ++predictorIndex) {
     if (predictorIndex == _lods.numPointsInLod[quantLayer]) {
@@ -763,68 +866,279 @@ AttributeEncoder::encodeColorsPred(
     const Vec3<attr_t> color = pointCloud.getColor(pointIndex);
     const Vec3<attr_t> predictedColor =
       predictor.predictColor(pointCloud, _lods.indexes);
+    double R_laser = 50.0;
+    double H_laser = 1;
+    double Ht = 1 / H_laser;
+    int64_t r = 0;
+    int64_t z = 0;
+    int64_t r1 = 0;
+    int64_t x_ = 0;
+    float_t K_ = 0;
 
-    Vec3<attr_t> reconstructedColor;
-    int64_t residual0 = 0;
-    for (int k = 0; k < 3; ++k) {
-      const auto& q = quant[std::min(k, 1)];
-      int64_t residual = color[k] - predictedColor[k];
+    //   //////////////////////////////////////////////////////////////////////////////////
 
-      int64_t residualQ = q.quantize(residual << kFixedPointAttributeShift);
-      int64_t residualR =
-        divExp2RoundHalfUp(q.scale(residualQ), kFixedPointAttributeShift);
+    P[0][1] = 200.0;
+    P[1][1] = 500.0;
+    P[2][1] = 450.0;
 
-      if (aps.inter_component_prediction_enabled_flag && k > 0) {
-        residual = residual - residual0;
-        residualQ = q.quantize(residual << kFixedPointAttributeShift);
-        residualR = residual0
-          + divExp2RoundHalfUp(q.scale(residualQ), kFixedPointAttributeShift);
+     if (predictorIndex > 0)
+
+    {
+      if (predictorIndex < A) {
+        if (predictorIndex < _lods.numPointsInLod[6]) {
+          if (flag_var[I - 6][2] == 1) {
+          
+          //  std::cout << "predictorIndex:\t" << predictorIndex << std::endl;
+            int m =
+              (_lods.numPointsInLod[u + 1] - _lods.numPointsInLod[u]) / 8;
+
+            if (predictorIndex < _lods.numPointsInLod[t]) {
+              for (int i = 0; i < 3; i++) {
+                reconstructedColor[i] = color[i];
+                color_real[j][i] = color[i];
+              }
+              j++;
+              for (int k = 0; k < 3; k++) {
+                int64_t y0 = reconstructedColor[k] - predictedColor[k];
+
+                float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+                float_t Si0 = 1 / S0;
+                K_ = P[k][predictorIndex] * Ht * Si0;
+
+                x_ = predictedColor[k] + K_ * y0;
+
+                realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+                P[k][predictorIndex + 1] =
+                  (1 - K_ * H_laser) * P[k][predictorIndex];
+              }
+
+              realColor = color;
+            }
+            if (predictorIndex >= _lods.numPointsInLod[t]) {
+              if (
+                predictorIndex == _lods.numPointsInLod[u]
+                || predictorIndex == _lods.numPointsInLod[u] + m
+                || predictorIndex == _lods.numPointsInLod[u] + 2 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 3 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 4 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 5 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 6 * m
+                || predictorIndex == _lods.numPointsInLod[u] - m) {
+                for (int i = 0; i < 3; i++) {
+                  reconstructedColor[i] = color[i];
+                  color_real[j][i] = color[i];
+                }
+                j++;
+              }
+
+              for (int k = 0; k < 3; k++) {
+                int64_t y0 = reconstructedColor[k] - predictedColor[k];
+
+                float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+                float_t Si0 = 1 / S0;
+                K_ = P[k][predictorIndex] * Ht * Si0;
+
+                x_ = predictedColor[k] + K_ * y0;
+
+                realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+                P[k][predictorIndex + 1] =
+                  (1 - K_ * H_laser) * P[k][predictorIndex];
+              }
+
+              if (
+                predictorIndex == _lods.numPointsInLod[u]
+                || predictorIndex == _lods.numPointsInLod[u] + m
+                || predictorIndex == _lods.numPointsInLod[u] + 2 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 3 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 4 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 5 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 6 * m
+                || predictorIndex == _lods.numPointsInLod[u] - m) {
+                realColor = color;
+              }
+            }
+
+            if (predictorIndex == _lods.numPointsInLod[u + 1] - 1) {
+              u++;
+            }
+          } else {
+            realColor = predictedColor;
+          }
+    
+        } else {
+     
+        /////////////////////////////////////////////////////////////////////////////////////////
+        if (predictorIndex >= _lods.numPointsInLod[6]) {
+          int m1 = (_lods.numPointsInLod[u + 1] - _lods.numPointsInLod[u]) / 8;
+
+          if (flag_var[I - 6][2] == 1) {
+            if (
+              predictorIndex == _lods.numPointsInLod[u]
+              || predictorIndex == _lods.numPointsInLod[u] + m1
+              || predictorIndex == _lods.numPointsInLod[u] + 2 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 3 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 4 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 5 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 6 * m1
+              || predictorIndex == _lods.numPointsInLod[u] - m1) {
+              for (int i = 0; i < 3; i++) {
+                reconstructedColor[i] = color[i];
+                color_real[j][i] = color[i];
+              }
+              j++;
+            }
+            for (int k = 0; k < 3; k++) {
+              int64_t y0 = reconstructedColor[k] - predictedColor[k];
+
+              float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+              float_t Si0 = 1 / S0;
+              K_ = P[k][predictorIndex] * Ht * Si0;
+
+              x_ = predictedColor[k] + K_ * y0;
+
+              realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+              P[k][predictorIndex + 1] =
+                (1 - K_ * H_laser) * P[k][predictorIndex];
+            }
+
+            if (
+              predictorIndex == _lods.numPointsInLod[u]
+              || predictorIndex == _lods.numPointsInLod[u] + m1
+              || predictorIndex == _lods.numPointsInLod[u] + 2 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 3 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 4 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 5 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 6 * m1
+              || predictorIndex == _lods.numPointsInLod[u] - m1) {
+              realColor = color;
+            }
+
+            if (predictorIndex == _lods.numPointsInLod[u + 1] - 1) {
+              u++;
+            }
+
+          } else {
+            realColor = predictedColor;
+          }
+        }
+		}
+      } else {
+        A = _lods.numPointsInLod[I + 1];
+        realColor = predictedColor;
+     
+        if (I == 6) {
+          P[0][predictorIndex + 1] = 200.0;
+          P[1][predictorIndex + 1] = 500.0;
+          P[2][predictorIndex + 1] = 450.0;
+        }
+        int ra = c_variance(pointCloud, _lods.numPointsInLod[I], A, 2);
+        int ba = c_variance(pointCloud, _lods.numPointsInLod[I], A, 1);
+        int ga = c_variance(pointCloud, _lods.numPointsInLod[I], A, 0);
+        if (flag_var[I - 6][2] == 1) {
+          if (ra <= 65 & ba <= 65 && ga <= 65) {
+            /*     realColor =
+              pointCloud.getColor(_lods.indexes[_lods.numPointsInLod[I]]);*/
+            flag_var[I - 5][2] = 1;
+            flag_var[I - 5][1] = 1;
+            flag_var[I - 5][0] = 1;
+          } else {
+            for (int i = I - 5; i < 12; i++)
+              flag_var[i][2] = 0;
+          }
+        }
+        I++;
       }
-
-      if (k == 0)
-        residual0 = residualR;
-
-      values[k] = residualQ;
-
-      int64_t recon = predictedColor[k] + residualR;
-      reconstructedColor[k] = attr_t(PCCClip(recon, int64_t(0), clipMax[k]));
     }
-    pointCloud.setColor(pointIndex, reconstructedColor);
+    //Vec3<attr_t> reconstructedColor;
+int64_t residual0 = 0;
+for (int k = 0; k < 3; ++k) {
+  const auto& q = quant[std::min(k, 1)];
+  int64_t residual = color[k] - realColor[k];
+  if (predictorIndex == 0)
+    residual = color[k] - predictedColor[k];
 
-    if (!values[0] && !values[1] && !values[2]) {
-      ++zero_cnt;
-    } else {
-      zerorun.push_back(zero_cnt);
-      zero_cnt = 0;
-    }
+  int64_t residualQ = q.quantize(residual << kFixedPointAttributeShift);
+  int64_t residualR =
+    divExp2RoundHalfUp(q.scale(residualQ), kFixedPointAttributeShift);
 
-    for (int i = 0; i < 3; i++) {
-      residual[i][predictorIndex] = values[i];
-    }
+  if (aps.inter_component_prediction_enabled_flag && k > 0) {
+    residual = residual - residual0;
+    residualQ = q.quantize(residual << kFixedPointAttributeShift);
+    residualR = residual0
+      + divExp2RoundHalfUp(q.scale(residualQ), kFixedPointAttributeShift);
   }
 
+  if (k == 0)
+    residual0 = residualR;
+
+  values[k] = residualQ;
+
+  int64_t recon = realColor[k] + residualR;
+  if (predictorIndex == 0)
+    recon = predictedColor[k] + residualR;
+  reconstructedColor[k] = attr_t(PCCClip(recon, int64_t(0), clipMax[k]));
+}
+pointCloud.setColor(pointIndex, reconstructedColor);
+
+if (!values[0] && !values[1] && !values[2]) {
+  ++zero_cnt;
+} else {
   zerorun.push_back(zero_cnt);
-  int run_index = 0;
-  encoder.encodeRunLength(zerorun[run_index]);
-  zero_cnt = zerorun[run_index++];
-  for (size_t predictorIndex = 0; predictorIndex < pointCount;
-       ++predictorIndex) {
-    auto& predictor = _lods.predictors[predictorIndex];
-    if (predictor.maxDiff >= aps.adaptive_prediction_threshold) {
-      encoder.encodePredMode(
-        predictor.predMode, aps.max_num_direct_predictors);
-    }
-    if (zero_cnt > 0)
-      zero_cnt--;
-    else {
-      for (size_t k = 0; k < 3; k++)
-        values[k] = residual[k][predictorIndex];
+  zero_cnt = 0;
+}
 
-      encoder.encode(values[0], values[1], values[2]);
-      encoder.encodeRunLength(zerorun[run_index]);
-      zero_cnt = zerorun[run_index++];
-    }
+for (int i = 0; i < 3; i++) {
+  residual[i][predictorIndex] = values[i];
+}
+}  // namespace pcc
+
+zerorun.push_back(zero_cnt);
+int Z_count = 0;
+for (int s = 0; s < size(_lods.numPointsInLod) - 6; s++) {
+  if (flag_var[0][0] == 0) {
+    Z_count = 0;
+    //  encoder.encodeZeroCnt(Z_count, pointCount);
+    s = size(_lods.numPointsInLod) - 6;
   }
+  if (flag_var[s][0] == 1) {
+    Z_count = Z_count + 1;
+
+  } else {
+    s = size(_lods.numPointsInLod) - 6;
+  }
+}
+encoder.encodeRunLength(Z_count);
+
+encoder.encodeRunLength(j);
+for (size_t predictorIndex1 = 0; predictorIndex1 < j; predictorIndex1++) {
+  encoder.encode(
+    color_real[predictorIndex1][0], color_real[predictorIndex1][1],
+    color_real[predictorIndex1][2]);
+}
+
+int run_index = 0;
+encoder.encodeRunLength(zerorun[run_index]);
+zero_cnt = zerorun[run_index++];
+for (size_t predictorIndex = 0; predictorIndex < pointCount;
+     ++predictorIndex) {
+  auto& predictor = _lods.predictors[predictorIndex];
+  if (predictor.maxDiff >= aps.adaptive_prediction_threshold) {
+    encoder.encodePredMode(predictor.predMode, aps.max_num_direct_predictors);
+  }
+  if (zero_cnt > 0)
+    zero_cnt--;
+  else {
+    for (size_t k = 0; k < 3; k++)
+      values[k] = residual[k][predictorIndex];
+
+    encoder.encode(values[0], values[1], values[2]);
+    encoder.encodeRunLength(zerorun[run_index]);
+    zero_cnt = zerorun[run_index++];
+  }
+}
 }
 
 //----------------------------------------------------------------------------

@@ -34,7 +34,7 @@
  */
 
 #include "AttributeDecoder.h"
-
+#include "colourspace.h"
 #include "AttributeCommon.h"
 #include "DualLutCoder.h"
 #include "constants.h"
@@ -434,6 +434,77 @@ AttributeDecoder::decodeColorsPred(
                         (1 << desc.bitdepthSecondary) - 1};
 
   int32_t values[3];
+  ///////////////////////////////////////////////////////////////////////////////解真实值
+  int64_t A = _lods.numPointsInLod[6];
+  std::vector<double> bP[3];
+  for (int i = 0; i < 3; i++) {
+    bP[i].resize(pointCount + 1);
+  }
+  std::vector<double> P[3];
+  for (int i = 0; i < 3; i++) {
+    P[i].resize(pointCount + 1);
+  }
+
+
+  std::vector<Vec3<uint32_t>> color_real;
+  int32_t real_value[3];
+  int u = 0;
+  int s = 0;
+  double R_laser = 50.0;
+  double H_laser = 1;
+  double Ht = 1 / H_laser;
+  int64_t r = 0;
+  int64_t z = 0;
+  int64_t r1 = 0;
+  int64_t x_ = 0;
+  float_t K_ = 0;
+  Vec3<attr_t> realColor = 0;
+  Vec3<attr_t> back_realColor = 0;
+  Vec3<attr_t> realColor1 = 0;
+  Vec3<attr_t> recon_color;
+  //Vec3<attr_t> realColor;
+  //Vec3<attr_t> realColor1;
+  Vec3<attr_t> realColor2;
+  Vec3<attr_t> recon_color0;
+  Vec3<attr_t> back_recon_color=0;
+  Vec3<attr_t> recon_color1;
+  Vec3<attr_t> recon_color2;
+  //std::vector<Vec3<uint32_t>> kft_color;
+  //   //////////////////////////////////////////////////////////////////////////////////
+
+  P[0][1] = 200.0;
+  P[1][1] = 500.0;
+  P[2][1] = 450.0;
+  bP[0][3] = 200.0;
+  bP[1][3] = 500.0;
+  bP[2][3] = 450.0;
+
+  if (_lods.numPointsInLod[3] - _lods.numPointsInLod[2] < 8) {
+    u = 3;
+  } else {
+    if (_lods.numPointsInLod[2] - _lods.numPointsInLod[1] < 8) {
+      u = 2;
+    } else {
+      u = 1;
+    }
+  }
+  int t = u;
+  std::vector<Vec3<int32_t>> kft_color;
+  int I = 6;
+  int flag_var = decoder.decodeRunLength();
+  int j = decoder.decodeRunLength();
+  int n = j;
+  int k = j - n;
+  for (int i = 0; i < j; i++) {
+    decoder.decode(real_value);
+    Vec3<int32_t> color_temp;
+    for (int j = 0; j < 3; j++) {
+      color_temp[j] = real_value[j];
+    }
+    color_real.push_back(color_temp);
+  }
+  // Vec3<attr_t>& color;
+  ///////////////////////////////////////////////////////////////////////////////////////
   int zero_cnt = decoder.decodeRunLength();
   int quantLayer = 0;
   for (size_t predictorIndex = 0; predictorIndex < pointCount;
@@ -442,6 +513,9 @@ AttributeDecoder::decodeColorsPred(
       quantLayer = std::min(int(qpSet.layers.size()) - 1, quantLayer + 1);
     }
     const uint32_t pointIndex = _lods.indexes[predictorIndex];
+	//----------------------------------------------
+  //  std::cout << "predictorIndex:\t" << predictorIndex << std::endl;
+    //----------------------------------------------
     auto quant = qpSet.quantizers(pointCloud[pointIndex], quantLayer);
     auto& predictor = _lods.predictors[predictorIndex];
 
@@ -455,21 +529,251 @@ AttributeDecoder::decodeColorsPred(
       zero_cnt = decoder.decodeRunLength();
     }
     Vec3<attr_t>& color = pointCloud.getColor(pointIndex);
+
+	    if (predictorIndex > 0) {
+      recon_color = pointCloud.getColor(_lods.indexes[predictorIndex - 1]);
+    }
+      if (predictorIndex > 2) {
+        recon_color0 = pointCloud.getColor(_lods.indexes[predictorIndex - 3]);
+        recon_color1 = pointCloud.getColor(_lods.indexes[predictorIndex - 2]);
+        recon_color2 = pointCloud.getColor(_lods.indexes[predictorIndex - 1]);
+      }
     const Vec3<attr_t> predictedColor =
       predictor.predictColor(pointCloud, _lods.indexes);
+
+
+	/////////////////////////////////////////////////////////////////////////////////////解码
+
+    if (predictorIndex > 0) {
+      if (predictorIndex < A) {
+        if (predictorIndex < _lods.numPointsInLod[6]) {
+          if (flag_var > 0) {
+            int m =
+              (_lods.numPointsInLod[u + 1] - _lods.numPointsInLod[u]) / 8;
+            if (predictorIndex < _lods.numPointsInLod[t]) {
+              for (int i = 0; i < 3; i++) {
+                recon_color[i] = color_real[k][i];
+              }
+              if (predictorIndex > 0) {
+              
+              for (int k = 0; k < 3; k++) {
+                int64_t y0 = recon_color[k] - predictedColor[k];
+
+                float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+                float_t Si0 = 1 / S0;
+                K_ = P[k][predictorIndex] * Ht * Si0;
+
+                x_ = predictedColor[k] + K_ * y0;
+
+                realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+                P[k][predictorIndex + 1] =
+                  (1 - K_ * H_laser) * P[k][predictorIndex];
+              }
+			  }
+              for (int i = 0; i < 3; i++) {
+                realColor[i] = color_real[k][i];
+              }
+              k++;
+            }
+            if (predictorIndex >= _lods.numPointsInLod[t]) {
+              if (
+                predictorIndex == _lods.numPointsInLod[u]
+                || predictorIndex == _lods.numPointsInLod[u] + m
+                || predictorIndex == _lods.numPointsInLod[u] + 2 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 3 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 4 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 5 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 6 * m
+                || predictorIndex == _lods.numPointsInLod[u] - m) {
+                for (int i = 0; i < 3; i++) {
+                  recon_color[i] = color_real[k][i];
+                }
+              }
+
+              for (int k = 0; k < 3; k++) {
+                int64_t y0 = recon_color[k] - predictedColor[k];
+
+                float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+                float_t Si0 = 1 / S0;
+                K_ = P[k][predictorIndex] * Ht * Si0;
+
+                x_ = predictedColor[k] + K_ * y0;
+
+                realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+                P[k][predictorIndex + 1] =
+                  (1 - K_ * H_laser) * P[k][predictorIndex];
+              }
+
+              if (
+                predictorIndex == _lods.numPointsInLod[u]
+                || predictorIndex == _lods.numPointsInLod[u] + m
+                || predictorIndex == _lods.numPointsInLod[u] + 2 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 3 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 4 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 5 * m
+                || predictorIndex == _lods.numPointsInLod[u] + 6 * m
+                || predictorIndex == _lods.numPointsInLod[u] - m) {
+                for (int i = 0; i < 3; i++) {
+                  realColor[i] = color_real[k][i];
+                }
+                k++;
+              }
+            }
+
+            if (predictorIndex == _lods.numPointsInLod[u + 1] - 1) {
+              u++;
+            }
+          } else {
+            realColor = predictedColor;
+          }
+        } else {
+     
+
+        /////////////////////////////////////////////////////////////////////////////////////////
+        if (predictorIndex >= _lods.numPointsInLod[6]) {
+          int m1 = (_lods.numPointsInLod[u + 1] - _lods.numPointsInLod[u]) / 8;
+
+          if (flag_var > 0) {
+            if (
+              predictorIndex == _lods.numPointsInLod[u]
+              || predictorIndex == _lods.numPointsInLod[u] + m1
+              || predictorIndex == _lods.numPointsInLod[u] + 2 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 3 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 4 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 5 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 6 * m1
+              || predictorIndex == _lods.numPointsInLod[u] - m1) {
+              for (int i = 0; i < 3; i++) {
+                recon_color[i] = color_real[k][i];
+              }
+            }
+            for (int k = 0; k < 3; k++) {
+              int64_t y0 = recon_color[k] - predictedColor[k];
+
+              float_t S0 = H_laser * P[k][predictorIndex] * Ht + R_laser;
+              float_t Si0 = 1 / S0;
+              K_ = P[k][predictorIndex] * Ht * Si0;
+
+              x_ = predictedColor[k] + K_ * y0;
+
+              realColor[k] = attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+              P[k][predictorIndex + 1] =
+                (1 - K_ * H_laser) * P[k][predictorIndex];
+            }
+
+            if (
+              predictorIndex == _lods.numPointsInLod[u]
+              || predictorIndex == _lods.numPointsInLod[u] + m1
+              || predictorIndex == _lods.numPointsInLod[u] + 2 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 3 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 4 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 5 * m1
+              || predictorIndex == _lods.numPointsInLod[u] + 6 * m1
+              || predictorIndex == _lods.numPointsInLod[u] - m1) {
+              for (int i = 0; i < 3; i++) {
+                realColor[i] = color_real[k][i];
+              }
+              k++;
+            }
+
+            if (predictorIndex == _lods.numPointsInLod[u + 1] - 1) {
+              u++;
+            }
+
+          } else {
+            realColor = predictedColor;
+          }
+        }
+		}
+      } else {
+        A = _lods.numPointsInLod[I + 1];
+        realColor = predictedColor;
+        /* if (flag_var[I - 6][2] == 1) {
+       realColor = pointCloud.getColor(_lods.indexes[_lods.numPointsInLod[I]]);
+        }*/
+        if (I == 6) {
+          P[0][predictorIndex + 1] = 200.0;
+          P[1][predictorIndex + 1] = 500.0;
+          P[2][predictorIndex + 1] = 450.0;
+        }
+        flag_var = flag_var - 1;
+        I++;
+      }
+    }
+    ////////////////////////////////////////////////////////////////////////////////////
+
 
     int64_t residual0 = 0;
     for (int k = 0; k < 3; ++k) {
       const auto& q = quant[std::min(k, 1)];
+      s = q.stepSize();
       const int64_t residual =
         divExp2RoundHalfUp(q.scale(values[k]), kFixedPointAttributeShift);
-      const int64_t recon = predictedColor[k] + residual + residual0;
+      int64_t recon = realColor[k] + residual + residual0;
+      if (predictorIndex == 0)
+        int64_t recon = predictedColor[k] + residual + residual0;
       color[k] = attr_t(PCCClip(recon, int64_t(0), clipMax[k]));
 
       if (!k && aps.inter_component_prediction_enabled_flag)
         residual0 = residual;
     }
+
+	     if (s < 2048) {
+          back_realColor = transformGbrToYCbCrBt709(color);
+         kft_color.push_back(back_realColor);
+        }
+
+        if (s >= 2048) {
+          if (predictorIndex > 2) {
+            auto out_yuv_color = transformGbrToYCbCrBt709(color);
+            for (int k = 0; k < 3; k++) {
+              back_recon_color[k] =
+                (recon_color0[k] + recon_color1[k] + recon_color2[k]) / 3;
+            }
+
+            auto out_yuv_recon = transformGbrToYCbCrBt709(back_recon_color);
+
+            back_realColor[0] = out_yuv_color[0];  //对y分量不做滤波处理
+            for (int k = 1; k < 3; k++) {
+              int64_t y0 = out_yuv_recon[k] - out_yuv_color[k];
+
+              float_t S0 = H_laser * bP[k][predictorIndex] * Ht + R_laser;
+              float_t Si0 = 1 / S0;
+              K_ = bP[k][predictorIndex] * Ht * Si0;
+
+              x_ = out_yuv_color[k] + K_ * y0;
+
+              back_realColor[k] =
+                attr_t(PCCClip(x_, int64_t(0), clipMax[k]));
+
+              bP[k][predictorIndex + 1] =
+                (1 - K_ * H_laser) * bP[k][predictorIndex];
+            }
+
+          } else {
+            back_realColor = transformGbrToYCbCrBt709(color);
+          }
+
+
+          kft_color.push_back(back_realColor);
+        }
+     
   }
+  ////////////////////////////////////////////////////////////////////////////////////////////
+    for (size_t predictorIndex1 = 0; predictorIndex1 < pointCount;
+         ++predictorIndex1) {
+      uint32_t pointIndex1 = _lods.indexes[predictorIndex1];
+      Vec3<attr_t>& color = pointCloud.getColor(pointIndex1);
+      Vec3<attr_t> realColor_1 = kft_color[predictorIndex1];
+      Vec3<attr_t> realColor_2;
+      realColor_2[2] = realColor_1[0];
+      realColor_2[1] = realColor_1[2];
+      realColor_2[0] = realColor_1[1];
+      color = realColor_2;
+    }
 }
 
 //----------------------------------------------------------------------------

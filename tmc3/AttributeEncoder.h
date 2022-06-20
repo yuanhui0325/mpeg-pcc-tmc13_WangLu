@@ -93,6 +93,9 @@ protected:
     PCCPointSet3& pointCloud,
     PCCResidualsEncoder& encoder);
 
+  double c_variance(
+    PCCPointSet3& pointCloud, int64_t pointCount1, int64_t pointCount2, int i);
+
   void encodeColorsPred(
     const AttributeDescription& desc,
     const AttributeParameterSet& aps,
@@ -129,6 +132,8 @@ protected:
     PCCResidualsEncoder& encoder,
     PCCResidualsEntropyEstimator& context,
     const Quantizers& quant);
+
+  double var_(std::vector<double>& val, int64_t len);
 
   static int64_t computeReflectanceResidual(
     const uint64_t reflectance,
