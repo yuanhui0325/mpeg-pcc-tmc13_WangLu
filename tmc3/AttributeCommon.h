@@ -51,9 +51,8 @@ public:
   void reset();
 
 protected:
-  AdaptiveBitModel ctxPredMode[2];
   AdaptiveBitModel ctxRunLen[5];
-  AdaptiveBitModel ctxCoeffEqN[2][7];
+  AdaptiveBitModel ctxCoeffGtN[2][7];
   AdaptiveBitModel ctxCoeffRemPrefix[2][3];
   AdaptiveBitModel ctxCoeffRemSuffix[2][3];
 };
@@ -96,6 +95,22 @@ private:
   // if the generated LoDs are reusable.
   AttributeBrickHeader _abh;
 };
+
+//============================================================================
+
+bool predModeEligibleColor(
+  const AttributeDescription& desc,
+  const AttributeParameterSet& aps,
+  const PCCPointSet3& pointCloud,
+  const std::vector<uint32_t>& indexes,
+  const PCCPredictor& predictor);
+
+bool predModeEligibleRefl(
+  const AttributeDescription& desc,
+  const AttributeParameterSet& aps,
+  const PCCPointSet3& pointCloud,
+  const std::vector<uint32_t>& indexes,
+  const PCCPredictor& predictor);
 
 //============================================================================
 

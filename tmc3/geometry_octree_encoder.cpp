@@ -44,6 +44,7 @@
 #include "quantization.h"
 
 #include <set>
+#include <random>
 
 namespace pcc {
 
@@ -73,39 +74,38 @@ public:
 
   void beginOctreeLevel(const Vec3<int>& planarDepth);
 
-  int encodePositionLeafNumPoints(int count);
+  void encodePositionLeafNumPoints(int count);
 
   int encodePlanarMode(
     OctreeNodePlanar& planar,
     int plane,
     int dist,
-    int neighb,
-    int& h,
+    int adjPlanes,
     int planeId,
     int contextAngle);
 
   void determinePlanarMode(
+    const bool& adjacent_child_contextualization_enabled_flag,
     int planeId,
     OctreeNodePlanar& planar,
-    uint8_t planarMode,
-    uint8_t planePosBits,
     OctreePlanarBuffer::Row* planeBuffer,
     int coord1,
     int coord2,
     int coord3,
-    uint8_t neighPattern,
-    int planarProb[3],
+    int posInParent,
+    const GeometryNeighPattern& gnp,
+    uint8_t siblingOccupancy,
     int planarRate[3],
     int contextAngle);
 
   void determinePlanarMode(
-    PCCPointSet3& pointCloud,
+    bool adjacent_child_contextualization_enabled_flag,
+    int occupancy,
     const bool planarEligible[3],
-    const Vec3<int>& childSizeLog2,
+    int posInParent,
+    const GeometryNeighPattern& gnp,
     PCCOctree3Node& child,
     OctreeNodePlanar& planar,
-    uint8_t neighPattern,
-    int planarProb[3],
     int contextAngle,
     int contextAnglePhiX,
     int contextAnglePhiY);
@@ -166,13 +166,10 @@ public:
   void encodeOccupancyBytewise(int neighPattern, int mappedOccupancy);
 
   void encodeOccupancy(
-    int neighPattern,
+    const GeometryNeighPattern& gnp,
     int occupancy,
     int occupancyIsPredicted,
     int occupancyPrediction,
-    int occupancyAdjGt0,
-    int occupancyAdjGt1,
-    int occupancyAdjUnocc,
     int planarMaskX,
     int planarMaskY,
     int planarMaskZ,
@@ -181,39 +178,39 @@ public:
     bool planarPossibleZ);
 
   void encodeOrdered2ptPrefix(
-    const PCCPointSet3& cloud,
-    int ptIdx,
-    Vec3<bool> directIdcm,
-    Vec3<int>& nodeSizeLog2);
+    const point_t points[2], Vec3<bool> directIdcm, Vec3<int>& nodeSizeLog2);
 
   void encodePointPosition(
     const Vec3<int>& nodeSizeLog2AfterPlanar, const Vec3<int32_t>& pos);
 
   void encodePointPositionAngular(
-    const Vec3<int>& nodeSizeLog2,
-    const Vec3<int>& nodeSizeLog2AfterPlanar,
-    const Vec3<int32_t>& pos,
-    const PCCOctree3Node& node,
+    const OctreeAngPosScaler& quant,
     const OctreeNodePlanar& planar,
-    const Vec3<int>& headPos,
+    const Vec3<int>& nodeSizeLog2Rem,
+    Vec3<int> posXyz,
+    const Vec3<int>& pos,
+    int nodeLaserIdx,
+    const Vec3<int>& angularOrigin,
     const int* zLaser,
     const int* thetaLaser,
     int numLasers);
 
+  void encodeNodeQpOffetsPresent(bool);
   void encodeQpOffset(int dqp);
 
   void encodeIsIdcm(DirectMode mode);
 
   void encodeDirectPosition(
-    DirectMode mode,
     bool geom_unique_points_flag,
     bool joint_2pt_idcm_enabled_flag,
+    bool geom_angular_mode_enabled_flag,
+    DirectMode mode,
+    const Vec3<uint32_t>& quantMasks,
     const Vec3<int>& nodeSizeLog2,
     int shiftBits,
-    PCCOctree3Node& node,
-    OctreeNodePlanar& planar,
+    const PCCOctree3Node& node,
+    const OctreeNodePlanar& planar,
     PCCPointSet3& pointCloud,
-    bool angularIdcm,
     const Vec3<int>& headPos,
     const int* zLaser,
     const int* thetaLaser,
@@ -253,9 +250,8 @@ GeometryOctreeEncoder::GeometryOctreeEncoder(
   , _neighPattern64toR1(neighPattern64toR1(gps))
   , _arithmeticEncoder(arithmeticEncoder)
   , _planar(gps)
-  , _phiBuffer(gps.geom_angular_num_lidar_lasers(), 0x80000000)
-  , _phiZi(
-      gps.geom_angular_num_lidar_lasers(), gps.geom_angular_num_phi_per_turn)
+  , _phiBuffer(gps.numLasers(), 0x80000000)
+  , _phiZi(gps.numLasers(), gps.angularNumPhiPerTurn)
 {
   if (!_useBitwiseOccupancyCoder && !gbh.entropy_continuation_flag) {
     for (int i = 0; i < 10; i++)
@@ -278,18 +274,16 @@ GeometryOctreeEncoder::beginOctreeLevel(const Vec3<int>& planarDepth)
 //============================================================================
 // Encode the number of points in a leaf node of the octree.
 
-int
+void
 GeometryOctreeEncoder::encodePositionLeafNumPoints(int count)
 {
-  if (count == 1) {
-    _arithmeticEncoder->encode(1, _ctxSinglePointPerBlock);
-  } else {
-    _arithmeticEncoder->encode(0, _ctxSinglePointPerBlock);
-    _arithmeticEncoder->encodeExpGolomb(
-      uint32_t(count - 2), 0, _ctxPointCountPerBlock);
-  }
+  int dupPointCnt = count - 1;
+  _arithmeticEncoder->encode(dupPointCnt > 0, _ctxDupPointCntGt0);
+  if (dupPointCnt <= 0)
+    return;
 
-  return count;
+  _arithmeticEncoder->encodeExpGolomb(dupPointCnt - 1, 0, _ctxDupPointCntEgl);
+  return;
 }
 
 //============================================================================
@@ -299,8 +293,7 @@ GeometryOctreeEncoder::encodePlanarMode(
   OctreeNodePlanar& node,
   int plane,
   int dist,
-  int neighb,
-  int& h,
+  int adjPlanes,
   int planeId,
   int contextAngle)
 {
@@ -309,8 +302,6 @@ GeometryOctreeEncoder::encodePlanarMode(
 
   bool isPlanar = node.planarMode & mask0;
   int planeBit = (node.planePosBits & mask0) == 0 ? 0 : 1;
-
-  int discreteDist = (dist <= (2 >> OctreePlanarBuffer::shiftAb) ? 0 : 1);
   _arithmeticEncoder->encode(isPlanar, _ctxPlanarMode[planeId]);
 
   if (!isPlanar) {
@@ -320,28 +311,24 @@ GeometryOctreeEncoder::encodePlanarMode(
 
   // encode the plane index
   if (contextAngle == -1) {  // angular mode off
+    static const int kAdjPlaneCtx[4] = {0, 1, 2, 0};
+    int planePosCtx = kAdjPlaneCtx[adjPlanes];
     if (plane < 0) {
-      _arithmeticEncoder->encode(planeBit, _ctxPlanarPlaneLastIndexZ[planeId]);
-      h =
-        approxSymbolProbability(planeBit, _ctxPlanarPlaneLastIndexZ[planeId]);
+      _arithmeticEncoder->encode(
+        planeBit, _ctxPlanarPlaneLastIndexZ[planePosCtx]);
     } else {
-      discreteDist += (dist <= (16 >> OctreePlanarBuffer::shiftAb) ? 0 : 1);
+      int discreteDist = dist > (8 >> OctreePlanarBuffer::shiftAb);
       int lastIndexPlane2d = plane + (discreteDist << 1);
       _arithmeticEncoder->encode(
-        planeBit, _ctxPlanarPlaneLastIndex[planeId][neighb][lastIndexPlane2d]);
-      h = approxSymbolProbability(
-        planeBit, _ctxPlanarPlaneLastIndex[planeId][neighb][lastIndexPlane2d]);
+        planeBit,
+        _ctxPlanarPlaneLastIndex[planeId][planePosCtx][lastIndexPlane2d]);
     }
   } else {               // angular mode on
     if (planeId == 2) {  // angular
       _arithmeticEncoder->encode(
         planeBit, _ctxPlanarPlaneLastIndexAngular[contextAngle]);
-      h = approxSymbolProbability(
-        planeBit, _ctxPlanarPlaneLastIndexAngular[contextAngle]);
     } else {  // azimuthal
       _arithmeticEncoder->encode(
-        planeBit, _ctxPlanarPlaneLastIndexAngularPhi[contextAngle]);
-      h = approxSymbolProbability(
         planeBit, _ctxPlanarPlaneLastIndexAngularPhi[contextAngle]);
     }
   }
@@ -353,34 +340,33 @@ GeometryOctreeEncoder::encodePlanarMode(
 
 void
 GeometryOctreeEncoder::determinePlanarMode(
+  const bool& adjacent_child_contextualization_enabled_flag,
   int planeId,
   OctreeNodePlanar& planar,
-  uint8_t planarMode,
-  uint8_t planePosBits,
   OctreePlanarBuffer::Row* planeBuffer,
   int coord1,
   int coord2,
   int coord3,
-  uint8_t neighPattern,
-  int planarProb[3],
+  int posInParent,
+  const GeometryNeighPattern& gnp,
+  uint8_t siblingOccupancy,
   int planarRate[3],
   int contextAngle)
 {
   const int kPlanarChildThreshold = 63;
   const int kAdjNeighIdxFromPlanePos[3][2] = {1, 0, 2, 3, 4, 5};
   const int planeSelector = 1 << planeId;
-
-  planar.planarMode |= planarMode & planeSelector;
-  planar.planePosBits |= planePosBits & planeSelector;
-
+  static const uint8_t KAdjNeighIdxMask[3][2] = {0x0f, 0xf0, 0x33,
+                                                 0xcc, 0x55, 0xaa};
   OctreePlanarBuffer::Elmt* row;
   int rowLen = OctreePlanarBuffer::rowSize;
   int closestPlanarFlag;
   int closestDist;
+  int maxCoord;
 
   if (!planeBuffer) {
     // angular: buffer disabled
-    closestPlanarFlag = 0;
+    closestPlanarFlag = -1;
     closestDist = 0;
   } else {
     coord1 =
@@ -391,44 +377,41 @@ GeometryOctreeEncoder::determinePlanarMode(
 
     row = planeBuffer[coord3];
 
-    int minDist = std::abs(coord1 - int(row[rowLen - 1].a))
-      + std::abs(coord2 - int(row[rowLen - 1].b));
+    maxCoord = std::max(coord1, coord2);
+    closestDist = std::abs(maxCoord - int(row[rowLen - 1].pos));
     int idxMinDist = rowLen - 1;
-
-    for (int idxP = 0; idxP < rowLen - 1; idxP++) {
-      int dist0 = std::abs(coord1 - int(row[idxP].a))
-        + std::abs(coord2 - int(row[idxP].b));
-      if (dist0 < minDist) {
-        idxMinDist = idxP;
-        minDist = dist0;
-      }
-    }
 
     // push closest point front
     row[rowLen - 1] = row[idxMinDist];
 
     closestPlanarFlag = row[idxMinDist].planeIdx;
-    closestDist = minDist;
-
-    for (int idxP = 0; idxP < rowLen - 1; idxP++) {
-      row[idxP] = row[idxP + 1];
-    }
   }
-  const int kAdjNeighIdxFromPlaneMask[3] = {0, 2, 4};
-  int adjNeigh = (neighPattern >> kAdjNeighIdxFromPlaneMask[planeId]) & 3;
-  int planeBit = encodePlanarMode(
-    planar, closestPlanarFlag, closestDist, adjNeigh, planarProb[planeId],
-    planeId, contextAngle);
 
-  bool isPlanar = (planar.planarMode & planeSelector)
-    && planarProb[planeId] > kPlanarChildThreshold;
+  // The relative plane position (0|1) along the planeId axis.
+  int pos = !(KAdjNeighIdxMask[planeId][0] & (1 << posInParent));
+
+  // Determine which adjacent planes are occupied
+  // The low plane is at position axis - 1
+  bool lowAdjPlaneOccupied = adjacent_child_contextualization_enabled_flag
+    ? KAdjNeighIdxMask[planeId][1] & gnp.adjNeighOcc[planeId]
+    : (gnp.neighPattern >> kAdjNeighIdxFromPlanePos[planeId][0]) & 1;
+
+  // The high adjacent plane is at position axis + 1
+  bool highAdjPlaneOccupied = !pos
+    ? KAdjNeighIdxMask[planeId][1] & siblingOccupancy
+    : (gnp.neighPattern >> kAdjNeighIdxFromPlanePos[planeId][1]) & 1;
+
+  int adjPlanes = (highAdjPlaneOccupied << 1) | lowAdjPlaneOccupied;
+  int planeBit = encodePlanarMode(
+    planar, closestPlanarFlag, closestDist, adjPlanes, planeId, contextAngle);
+
+  bool isPlanar = (planar.planarMode & planeSelector);
 
   planarRate[planeId] =
     (255 * planarRate[planeId] + (isPlanar ? 256 * 8 : 0) + 128) >> 8;
 
-  if (planeBuffer) {
-    row[rowLen - 1] = {unsigned(coord1), planeBit, unsigned(coord2)};
-  }
+  if (planeBuffer)
+    row[rowLen - 1] = {unsigned(maxCoord), planeBit};
 }
 
 //============================================================================
@@ -436,24 +419,28 @@ GeometryOctreeEncoder::determinePlanarMode(
 
 void
 GeometryOctreeEncoder::determinePlanarMode(
-  PCCPointSet3& pointCloud,
+  bool adjacent_child_contextualization_enabled_flag,
+  int occupancy,
   const bool planarEligible[3],
-  const Vec3<int>& childSizeLog2,
+  int posInParent,
+  const GeometryNeighPattern& gnp,
   PCCOctree3Node& node,
   OctreeNodePlanar& planar,
-  uint8_t neighPattern,
-  int planarProb[3],
   int contextAngle,
   int contextAnglePhiX,
   int contextAnglePhiY)
 {
   auto& planeBuffer = _planar._planarBuffer;
 
-  // planarity
-  uint8_t planarMode, planePosBits;
-  isPlanarNode(
-    pointCloud, node, childSizeLog2 - 1, planarMode, planePosBits,
-    planarEligible);
+  // determine what planes exist in occupancy
+  setPlanesFromOccupancy(occupancy, planar);
+
+  uint8_t planarEligibleMask = 0;
+  planarEligibleMask |= planarEligible[2] << 2;
+  planarEligibleMask |= planarEligible[1] << 1;
+  planarEligibleMask |= planarEligible[0] << 0;
+  planar.planarMode &= planarEligibleMask;
+  planar.planePosBits &= planarEligibleMask;
 
   int xx = node.pos[0];
   int yy = node.pos[1];
@@ -462,20 +449,23 @@ GeometryOctreeEncoder::determinePlanarMode(
   // planar x
   if (planarEligible[0]) {
     determinePlanarMode(
-      0, planar, planarMode, planePosBits, planeBuffer.getBuffer(0), yy, zz,
-      xx, neighPattern, planarProb, _planar._rate.data(), contextAnglePhiX);
+      adjacent_child_contextualization_enabled_flag, 0, planar,
+      planeBuffer.getBuffer(0), yy, zz, xx, posInParent, gnp,
+      node.siblingOccupancy, _planar._rate.data(), contextAnglePhiX);
   }
   // planar y
   if (planarEligible[1]) {
     determinePlanarMode(
-      1, planar, planarMode, planePosBits, planeBuffer.getBuffer(1), xx, zz,
-      yy, neighPattern, planarProb, _planar._rate.data(), contextAnglePhiY);
+      adjacent_child_contextualization_enabled_flag, 1, planar,
+      planeBuffer.getBuffer(1), xx, zz, yy, posInParent, gnp,
+      node.siblingOccupancy, _planar._rate.data(), contextAnglePhiY);
   }
   // planar z
   if (planarEligible[2]) {
     determinePlanarMode(
-      2, planar, planarMode, planePosBits, planeBuffer.getBuffer(2), xx, yy,
-      zz, neighPattern, planarProb, _planar._rate.data(), contextAngle);
+      adjacent_child_contextualization_enabled_flag, 2, planar,
+      planeBuffer.getBuffer(2), xx, yy, zz, posInParent, gnp,
+      node.siblingOccupancy, _planar._rate.data(), contextAngle);
   }
 }
 
@@ -762,13 +752,10 @@ GeometryOctreeEncoder::encodeOccupancyBytewise(
 
 void
 GeometryOctreeEncoder::encodeOccupancy(
-  int neighPattern,
+  const GeometryNeighPattern& gnp,
   int occupancy,
   int occupancyIsPred,
   int occupancyPred,
-  int occupancyAdjGt0,
-  int occupancyAdjGt1,
-  int occupancyAdjUnocc,
   int planarMaskX,
   int planarMaskY,
   int planarMaskZ,
@@ -780,7 +767,7 @@ GeometryOctreeEncoder::encodeOccupancy(
   if (planarMaskX && planarMaskY && planarMaskZ)
     return;
 
-  if (neighPattern == 0) {
+  if (gnp.neighPattern == 0) {
     bool singleChild = !popcntGt1(occupancy);
     if (planarPossibleX && planarPossibleY && planarPossibleZ) {
       _arithmeticEncoder->encode(singleChild, _ctxSingleChild);
@@ -803,7 +790,7 @@ GeometryOctreeEncoder::encodeOccupancy(
   }
 
   // at least two child nodes occupied and two planars => we know the occupancy
-  if (neighPattern == 0) {
+  if (gnp.neighPattern == 0) {
     if (planarMaskX && planarMaskY)
       return;
     if (planarMaskY && planarMaskZ)
@@ -812,20 +799,21 @@ GeometryOctreeEncoder::encodeOccupancy(
       return;
   }
 
-  uint32_t mapOcc = mapGeometryOccupancy(occupancy, neighPattern);
-  uint32_t mapOccIsP = mapGeometryOccupancy(occupancyIsPred, neighPattern);
-  uint32_t mapOccP = mapGeometryOccupancy(occupancyPred, neighPattern);
-  uint32_t mapAdjGt0 = mapGeometryOccupancy(occupancyAdjGt0, neighPattern);
-  uint32_t mapAdjGt1 = mapGeometryOccupancy(occupancyAdjGt1, neighPattern);
-  uint32_t mapAdjUnocc = mapGeometryOccupancy(occupancyAdjUnocc, neighPattern);
+  auto neighPattern = gnp.neighPattern;
+  auto mapOcc = mapGeometryOccupancy(occupancy, neighPattern);
+  auto mapOccIsP = mapGeometryOccupancy(occupancyIsPred, neighPattern);
+  auto mapOccP = mapGeometryOccupancy(occupancyPred, neighPattern);
+  auto mapAdjGt0 = mapGeometryOccupancy(gnp.adjacencyGt0, neighPattern);
+  auto mapAdjGt1 = mapGeometryOccupancy(gnp.adjacencyGt1, neighPattern);
+  auto mapAdjUnocc = mapGeometryOccupancy(gnp.adjacencyUnocc, neighPattern);
 
-  uint32_t mapPlanarMaskX = mapGeometryOccupancy(planarMaskX, neighPattern);
-  uint32_t mapPlanarMaskY = mapGeometryOccupancy(planarMaskY, neighPattern);
-  uint32_t mapPlanarMaskZ = mapGeometryOccupancy(planarMaskZ, neighPattern);
+  auto mapPlanarMaskX = mapGeometryOccupancy(planarMaskX, neighPattern);
+  auto mapPlanarMaskY = mapGeometryOccupancy(planarMaskY, neighPattern);
+  auto mapPlanarMaskZ = mapGeometryOccupancy(planarMaskZ, neighPattern);
 
-  uint32_t mapFixedMaskX0 = mapGeometryOccupancy(0xf0, neighPattern);
-  uint32_t mapFixedMaskY0 = mapGeometryOccupancy(0xcc, neighPattern);
-  uint32_t mapFixedMaskZ0 = mapGeometryOccupancy(0xaa, neighPattern);
+  auto mapFixedMaskX0 = mapGeometryOccupancy(0xf0, neighPattern);
+  auto mapFixedMaskY0 = mapGeometryOccupancy(0xcc, neighPattern);
+  auto mapFixedMaskZ0 = mapGeometryOccupancy(0xaa, neighPattern);
 
   if (_useBitwiseOccupancyCoder)
     encodeOccupancyBitwise(
@@ -841,10 +829,7 @@ GeometryOctreeEncoder::encodeOccupancy(
 // Encode part of the position of two unordred points  point in a given volume.
 void
 GeometryOctreeEncoder::encodeOrdered2ptPrefix(
-  const PCCPointSet3& cloud,
-  int ptIdx,
-  Vec3<bool> directIdcm,
-  Vec3<int>& nodeSizeLog2)
+  const point_t points[2], Vec3<bool> directIdcm, Vec3<int>& nodeSizeLog2)
 {
   if (nodeSizeLog2[0] >= 1 && directIdcm[0]) {
     bool sameBit = true;
@@ -852,8 +837,8 @@ GeometryOctreeEncoder::encodeOrdered2ptPrefix(
     while (nodeSizeLog2[0] && sameBit) {
       nodeSizeLog2[0]--;
       int mask = 1 << nodeSizeLog2[0];
-      auto bit0 = !!(cloud[ptIdx][0] & mask);
-      auto bit1 = !!(cloud[ptIdx + 1][0] & mask);
+      auto bit0 = !!(points[0][0] & mask);
+      auto bit1 = !!(points[1][0] & mask);
       sameBit = bit0 == bit1;
 
       _arithmeticEncoder->encode(sameBit, _ctxSameBitHighx[ctxIdx]);
@@ -864,14 +849,14 @@ GeometryOctreeEncoder::encodeOrdered2ptPrefix(
   }
 
   if (nodeSizeLog2[1] >= 1 && directIdcm[1]) {
-    bool sameX = !directIdcm[0] || cloud[ptIdx][0] == cloud[ptIdx + 1][0];
+    bool sameX = !directIdcm[0] || points[0][0] == points[1][0];
     bool sameBit = true;
     int ctxIdx = 0;
     while (nodeSizeLog2[1] && sameBit) {
       nodeSizeLog2[1]--;
       int mask = 1 << nodeSizeLog2[1];
-      auto bit0 = !!(cloud[ptIdx][1] & mask);
-      auto bit1 = !!(cloud[ptIdx + 1][1] & mask);
+      auto bit0 = !!(points[0][1] & mask);
+      auto bit1 = !!(points[1][1] & mask);
       sameBit = bit0 == bit1;
 
       _arithmeticEncoder->encode(sameBit, _ctxSameBitHighy[ctxIdx]);
@@ -883,14 +868,14 @@ GeometryOctreeEncoder::encodeOrdered2ptPrefix(
 
   if (nodeSizeLog2[2] >= 1 && directIdcm[2]) {
     bool sameBit = true;
-    bool sameXy = (!directIdcm[0] || cloud[ptIdx][0] == cloud[ptIdx + 1][0])
-      && (!directIdcm[1] || cloud[ptIdx][1] == cloud[ptIdx + 1][1]);
+    bool sameXy = (!directIdcm[0] || points[0][0] == points[1][0])
+      && (!directIdcm[1] || points[0][1] == points[1][1]);
     int ctxIdx = 0;
     while (nodeSizeLog2[2] && sameBit) {
       nodeSizeLog2[2]--;
       int mask = 1 << nodeSizeLog2[2];
-      auto bit0 = !!(cloud[ptIdx][2] & mask);
-      auto bit1 = !!(cloud[ptIdx + 1][2] & mask);
+      auto bit0 = !!(points[0][2] & mask);
+      auto bit1 = !!(points[1][2] & mask);
       sameBit = bit0 == bit1;
 
       _arithmeticEncoder->encode(sameBit, _ctxSameBitHighz[ctxIdx]);
@@ -918,88 +903,65 @@ GeometryOctreeEncoder::encodePointPosition(
 }
 
 //-------------------------------------------------------------------------
-// Encode a position of a point in a given volume, using elevation angle prior
+// Encode a position of a point in a given volume, using elevation angle prior.
+//
+// pos is the point position to be coded.
+// posXyz is initially the node position relative to the angular origin,
+// and updated as bits are coded.
 
 void
 GeometryOctreeEncoder::encodePointPositionAngular(
-  const Vec3<int>& nodeSizeLog2,
-  const Vec3<int>& nodeSizeLog2AfterUnordered,
-  const Vec3<int32_t>& pos,
-  const PCCOctree3Node& child,
+  const OctreeAngPosScaler& quant,
   const OctreeNodePlanar& planar,
-  const Vec3<int>& headPos,
+  const Vec3<int>& nodeSizeLog2Rem,
+  Vec3<int> posXyz,
+  const Vec3<int>& pos,
+  int nodeLaserIdx,
+  const Vec3<int>& angularOrigin,
   const int* zLaser,
   const int* thetaLaser,
   int numLasers)
 {
-  Vec3<int> posXyz = {(child.pos[0] << nodeSizeLog2[0]) - headPos[0],
-                      (child.pos[1] << nodeSizeLog2[1]) - headPos[1],
-                      (child.pos[2] << nodeSizeLog2[2]) - headPos[2]};
-
   // -- PHI --
   // code x or y directly and compute phi of node
-  bool codeXorY = std::abs(posXyz[0]) <= std::abs(posXyz[1]);
-  if (codeXorY) {  // direct code y
-    if (nodeSizeLog2AfterUnordered[1])
-      for (int mask = 1 << (nodeSizeLog2AfterUnordered[1] - 1); mask;
-           mask >>= 1)
-        _arithmeticEncoder->encode(!!(pos[1] & mask));
+  bool directAxis = std::abs(posXyz[0]) <= std::abs(posXyz[1]);
 
-    posXyz[1] = pos[1] - headPos[1];
-    if (planar.planarMode & 1) {
-      int mask = 1 << (nodeSizeLog2[0] - 1);
-      if (pos[0] & mask)
-        posXyz[0] += mask;
-    }
-  } else {  //direct code x
-    if (nodeSizeLog2AfterUnordered[0])
-      for (int mask = 1 << (nodeSizeLog2AfterUnordered[0] - 1); mask;
-           mask >>= 1)
-        _arithmeticEncoder->encode(!!(pos[0] & mask));
+  for (int mask = (1 << nodeSizeLog2Rem[directAxis]) >> 1; mask; mask >>= 1)
+    _arithmeticEncoder->encode(!!(pos[directAxis] & mask));
 
-    posXyz[0] = pos[0] - headPos[0];
-    if (planar.planarMode & 2) {
-      int mask = 1 << (nodeSizeLog2[1] - 1);
-      if (pos[1] & mask)
-        posXyz[1] += mask;
-    }
-  }
+  // update the known position to take into account all coded bits
+  for (int k = 0; k < 3; k++)
+    if (k != directAxis)
+      if (planar.planePosBits & (1 << k))
+        posXyz[k] += quant.scaleEns(k, 1 << nodeSizeLog2Rem[k]);
+
+  posXyz[directAxis] =
+    quant.scaleEns(directAxis, pos[directAxis]) - angularOrigin[directAxis];
 
   // Laser
-  int laserNode = int(child.laserIndex);
-
-  point_t posPointLidar =
-    point_t(pos[0] - headPos[0], pos[1] - headPos[1], pos[2] - headPos[2]);
-  int laserIndex = findLaser(posPointLidar, thetaLaser, numLasers);
-  encodeThetaRes(laserIndex - laserNode);
+  int laserIdx =
+    findLaser(quant.scaleEns(pos) - angularOrigin, thetaLaser, numLasers);
+  encodeThetaRes(laserIdx - nodeLaserIdx);
 
   // find predictor
   int phiNode = iatan2(posXyz[1], posXyz[0]);
-  int predPhi = _phiBuffer[laserIndex];
+  int predPhi = _phiBuffer[laserIdx];
   if (predPhi == 0x80000000)
     predPhi = phiNode;
 
   // elementary shift predictor
   int nShift =
-    ((predPhi - phiNode) * _phiZi.invDelta(laserIndex) + 536870912) >> 30;
-  predPhi -= _phiZi.delta(laserIndex) * nShift;
-
-  // choose x or y
-  int* posXY = codeXorY ? &posXyz[0] : &posXyz[1];
-  int idx = codeXorY ? 0 : 1;
+    ((predPhi - phiNode) * _phiZi.invDelta(laserIdx) + (1 << 29)) >> 30;
+  predPhi -= _phiZi.delta(laserIdx) * nShift;
 
   // azimuthal code x or y
-  int mask2 = codeXorY ? (nodeSizeLog2AfterUnordered[0] > 0
-                            ? 1 << (nodeSizeLog2AfterUnordered[0] - 1)
-                            : 0)
-                       : (nodeSizeLog2AfterUnordered[1] > 0
-                            ? 1 << (nodeSizeLog2AfterUnordered[1] - 1)
-                            : 0);
-  for (; mask2; mask2 >>= 1) {
+  const int phiAxis = !directAxis;
+  for (int mask = (1 << nodeSizeLog2Rem[phiAxis]) >> 1; mask; mask >>= 1) {
     // angles left and right
-    int phiR = codeXorY ? iatan2(posXyz[1], posXyz[0] + mask2)
-                        : iatan2(posXyz[1] + mask2, posXyz[0]);
+    int scaledMask = quant.scaleEns(phiAxis, mask);
     int phiL = phiNode;
+    int phiR = directAxis ? iatan2(posXyz[1], posXyz[0] + scaledMask)
+                          : iatan2(posXyz[1] + scaledMask, posXyz[0]);
 
     // ctx azimutal
     int angleL = phiL - predPhi;
@@ -1010,45 +972,35 @@ GeometryOctreeEncoder::encodePointPositionAngular(
     angleR = std::abs(angleR);
     if (angleL > angleR) {
       contextAnglePhi++;
-      int temp = angleL;
-      angleL = angleR;
-      angleR = temp;
+      std::swap(angleL, angleR);
     }
     if (angleR > (angleL << 1))
       contextAnglePhi += 4;
 
     // entropy coding
-    int bit = !!(pos[idx] & mask2);
-    _arithmeticEncoder->encode(
-      bit, _ctxPlanarPlaneLastIndexAngularPhiIDCM[contextAnglePhi]);
+    int bit = !!(pos[phiAxis] & mask);
+    auto& ctx = _ctxPlanarPlaneLastIndexAngularPhiIDCM[contextAnglePhi];
+    _arithmeticEncoder->encode(bit, ctx);
     if (bit) {
-      *posXY += mask2;
+      posXyz[phiAxis] += scaledMask;
       phiNode = phiR;
-      predPhi = _phiBuffer[laserIndex];
+      predPhi = _phiBuffer[laserIdx];
       if (predPhi == 0x80000000)
         predPhi = phiNode;
 
       // elementary shift predictor
       int nShift =
-        ((predPhi - phiNode) * _phiZi.invDelta(laserIndex) + 536870912) >> 30;
-      predPhi -= _phiZi.delta(laserIndex) * nShift;
+        ((predPhi - phiNode) * _phiZi.invDelta(laserIdx) + (1 << 29)) >> 30;
+      predPhi -= _phiZi.delta(laserIdx) * nShift;
     }
   }
 
-  _phiBuffer[laserIndex] = phiNode;
+  _phiBuffer[laserIdx] = phiNode;
 
   // -- THETA --
-  int maskz = nodeSizeLog2AfterUnordered[2] > 0
-    ? 1 << (nodeSizeLog2AfterUnordered[2] - 1)
-    : 0;
+  int maskz = (1 << nodeSizeLog2Rem[2]) >> 1;
   if (!maskz)
     return;
-
-  if (planar.planarMode & 4) {
-    int mask = 1 << (nodeSizeLog2[2] - 1);
-    if (pos[2] & mask)
-      posXyz[2] += mask;
-  }
 
   // Since x and y are known,
   // r is known too and does not depend on the bit for z
@@ -1058,14 +1010,15 @@ GeometryOctreeEncoder::encodePointPositionAngular(
   int64_t rInv = irsqrt(r2);
 
   // code z
-  int64_t hr = zLaser[laserIndex] * rInv;
+  int64_t hr = zLaser[laserIdx] * rInv;
   int fixedThetaLaser =
-    thetaLaser[laserIndex] + int(hr >= 0 ? -(hr >> 17) : ((-hr) >> 17));
+    thetaLaser[laserIdx] + int(hr >= 0 ? -(hr >> 17) : ((-hr) >> 17));
 
-  int zShift = (rInv << nodeSizeLog2AfterUnordered[2]) >> 18;
+  int zShift = rInv * quant.scaleEns(2, 1 << nodeSizeLog2Rem[2]) >> 18;
   for (; maskz; maskz >>= 1, zShift >>= 1) {
     // determine non-corrected theta
-    int64_t zLidar = ((posXyz[2] + maskz) << 1) - 1;
+    int scaledMaskZ = quant.scaleEns(2, maskz);
+    int64_t zLidar = ((posXyz[2] + scaledMaskZ) << 1) - 1;
     int64_t theta = zLidar * rInv;
     int theta32 = theta >= 0 ? theta >> 15 : -((-theta) >> 15);
     int thetaLaserDelta = fixedThetaLaser - theta32;
@@ -1079,41 +1032,91 @@ GeometryOctreeEncoder::encodePointPositionAngular(
       contextAngle += 2;
 
     int bit = !!(pos[2] & maskz);
-    _arithmeticEncoder->encode(
-      bit, _ctxPlanarPlaneLastIndexAngularIdcm[contextAngle]);
+    auto& ctx = _ctxPlanarPlaneLastIndexAngularIdcm[contextAngle];
+    _arithmeticEncoder->encode(bit, ctx);
     if (bit)
-      posXyz[2] += maskz;
+      posXyz[2] += scaledMaskZ;
   }
 }
 
 //-------------------------------------------------------------------------
-// Direct coding of position of points in node (early tree termination).
+
+void
+GeometryOctreeEncoder::encodeNodeQpOffetsPresent(bool flag)
+{
+  _arithmeticEncoder->encode(flag);
+}
+
+//-------------------------------------------------------------------------
+
 void
 GeometryOctreeEncoder::encodeQpOffset(int dqp)
 {
-  _arithmeticEncoder->encode(dqp == 0, _ctxQpOffsetIsZero);
-  if (dqp == 0) {
+  _arithmeticEncoder->encode(dqp != 0, _ctxQpOffsetAbsGt0);
+  if (dqp == 0)
     return;
-  }
-  _arithmeticEncoder->encode(dqp > 0, _ctxQpOffsetSign);
+
   _arithmeticEncoder->encodeExpGolomb(abs(dqp) - 1, 0, _ctxQpOffsetAbsEgl);
+  _arithmeticEncoder->encode(dqp < 0, _ctxQpOffsetSign);
 }
 
 //-------------------------------------------------------------------------
 
 template<typename It>
 void
-calculateNodeQps(
+setNodeQpsUniform(
+  Vec3<int> nodeSizeLog2,
+  int qp,
+  int geom_qp_multiplier_log2,
+  It nodesBegin,
+  It nodesEnd)
+{
+  // Conformance: limit the qp such that it cannot overquantize the node
+  qp = std::min(qp, nodeSizeLog2.min() * 8);
+  assert(qp % (1 << geom_qp_multiplier_log2) == 0);
+
+  for (auto it = nodesBegin; it != nodesEnd; ++it)
+    it->qp = qp;
+}
+
+//-------------------------------------------------------------------------
+// Sets QP randomly
+
+template<typename It>
+void
+setNodeQpsRandom(
+  Vec3<int> nodeSizeLog2,
+  int /* qp */,
+  int geom_qp_multiplier_log2,
+  It nodesBegin,
+  It nodesEnd)
+{
+  // Conformance: limit the qp such that it cannot overquantize the node
+  int maxQp = nodeSizeLog2.min() * 8;
+
+  int seed = getenv("SEED") ? atoi(getenv("SEED")) : 0;
+  static std::minstd_rand gen(seed);
+  std::uniform_int_distribution<> uniform(0, maxQp);
+
+  // pick a random qp, avoiding unrepresentable values
+  for (auto it = nodesBegin; it != nodesEnd; ++it)
+    it->qp = uniform(gen) & (~0 << geom_qp_multiplier_log2);
+}
+
+//-------------------------------------------------------------------------
+// determine delta qp for each node based on the point density
+
+template<typename It>
+void
+setNodeQpsByDensity(
   Vec3<int> nodeSizeLog2,
   int baseQp,
   int geom_qp_multiplier_log2,
   It nodesBegin,
   It nodesEnd)
 {
-  // determine delta qp for each node based on the point density
   // Conformance: limit the qp such that it cannot overquantize the node
-  int minNs = nodeSizeLog2.min();
-  int maxQp = minNs * 8 - (1 << geom_qp_multiplier_log2);
+  int maxQp = nodeSizeLog2.min() * 8;
   int lowQp = PCCClip(baseQp - 8, 0, maxQp);
   int mediumQp = std::min(baseQp, maxQp);
   int highQp = std::min(baseQp + 8, maxQp);
@@ -1152,6 +1155,31 @@ calculateNodeQps(
     else
       it->qp = lowQp;
   }
+}
+
+//-------------------------------------------------------------------------
+
+template<typename It>
+void
+calculateNodeQps(
+  OctreeEncOpts::QpMethod method,
+  Vec3<int> nodeSizeLog2,
+  int baseQp,
+  int geom_qp_multiplier_log2,
+  It nodesBegin,
+  It nodesEnd)
+{
+  auto fn = &setNodeQpsUniform<It>;
+
+  switch (method) {
+    using Method = OctreeEncOpts::QpMethod;
+  default:
+  case Method::kUniform: fn = &setNodeQpsUniform<It>; break;
+  case Method::kRandom: fn = &setNodeQpsRandom<It>; break;
+  case Method::kByDensity: fn = &setNodeQpsByDensity<It>; break;
+  }
+
+  fn(nodeSizeLog2, baseQp, geom_qp_multiplier_log2, nodesBegin, nodesEnd);
 }
 
 //-------------------------------------------------------------------------
@@ -1225,6 +1253,7 @@ checkDuplicatePoints(
 }
 
 //-------------------------------------------------------------------------
+// Direct coding of position of points in node (early tree termination).
 
 DirectMode
 canEncodeDirectPosition(
@@ -1264,16 +1293,17 @@ GeometryOctreeEncoder::encodeIsIdcm(DirectMode mode)
 
 void
 GeometryOctreeEncoder::encodeDirectPosition(
-  DirectMode mode,
   bool geom_unique_points_flag,
   bool joint_2pt_idcm_enabled_flag,
-  const Vec3<int>& nodeSizeLog2,
+  bool geom_angular_mode_enabled_flag,
+  DirectMode mode,
+  const Vec3<uint32_t>& quantMasks,
+  const Vec3<int>& effectiveNodeSizeLog2,
   int shiftBits,
-  PCCOctree3Node& node,
-  OctreeNodePlanar& planar,
+  const PCCOctree3Node& node,
+  const OctreeNodePlanar& planar,
   PCCPointSet3& pointCloud,
-  bool angularIdcm,
-  const Vec3<int>& headPos,
+  const Vec3<int>& angularOrigin,
   const int* zLaser,
   const int* thetaLaser,
   int numLasers)
@@ -1286,77 +1316,95 @@ GeometryOctreeEncoder::encodeDirectPosition(
   case DirectMode::kTwoPoints:
     _arithmeticEncoder->encode(numPoints > 1, _ctxNumIdcmPointsGt1);
     if (!geom_unique_points_flag && numPoints == 1)
-      _arithmeticEncoder->encode(numPoints == 1, _ctxSinglePointPerBlock);
+      _arithmeticEncoder->encode(0, _ctxDupPointCntGt0);
     break;
 
   case DirectMode::kAllPointSame:
     _arithmeticEncoder->encode(0, _ctxNumIdcmPointsGt1);
-    _arithmeticEncoder->encode(0, _ctxSinglePointPerBlock);
-    _arithmeticEncoder->encode(numPoints == 2, _ctxSingleIdcmDupPoint);
-    if (numPoints > 2)
+    _arithmeticEncoder->encode(1, _ctxDupPointCntGt0);
+    _arithmeticEncoder->encode(numPoints - 1 > 1, _ctxDupPointCntGt1);
+    if (numPoints - 1 > 1)
       _arithmeticEncoder->encodeExpGolomb(
-        numPoints - 3, 0, _ctxPointCountPerBlock);
+        numPoints - 3, 0, _ctxDupPointCntEgl);
 
     // only one actual psoition to code
     numPoints = 1;
   }
 
+  // if the points have been quantised, the following representation is used
+  // for point cloud positions:
+  //          |---| = nodeSizeLog2 (example)
+  //   ppppppqqqq00 = cloud[ptidx]
+  //          |-|   = effectiveNodeSizeLog2 (example)
+  // where p are unquantised bits, qqq are quantised bits, and 0 are zero bits.
+  // nodeSizeLog2 is the size of the current node prior to quantisation.
+  // effectiveNodeSizeLog2 is the size of the node after quantisation.
+  //
+  // NB: while nodeSizeLog2 may be used to access the current position bit
+  //     in both quantised and unquantised forms, effectiveNodeSizeLog2 cannot
+  //     without taking into account the padding.
+  //
+  // NB: this contrasts with node.pos, which contains the previously coded
+  //     position bits ("ppppppq" in the above example) without any padding.
+  //
+  // When coding the direct mode, the zero padding is removed to permit
+  // indexing by the effective node size instead.
+  Vec3<int> points[2];
+  for (int i = 0; i < numPoints; i++)
+    points[i] = pointCloud[node.start + i] >> shiftBits;
+
+  OctreeAngPosScaler quant(node.qp, quantMasks);
+
   // update node size after planar
-  Vec3<int> nodeSizeLog2Rem = nodeSizeLog2;
+  Vec3<int> nodeSizeLog2Rem = effectiveNodeSizeLog2;
   for (int k = 0; k < 3; k++)
     if (nodeSizeLog2Rem[k] > 0 && (planar.planarMode & (1 << k)))
       nodeSizeLog2Rem[k]--;
 
   // Indicates which components are directly coded, or coded using angular
   // contextualisation.
-  Vec3<bool> directIdcm = !angularIdcm;
-  point_t posNodeLidar;
+  Vec3<bool> directIdcm = true;
 
-  if (angularIdcm) {
-    posNodeLidar =
-      point_t(
-        node.pos[0] << nodeSizeLog2[0], node.pos[1] << nodeSizeLog2[1],
-        node.pos[2] << nodeSizeLog2[2])
-      - headPos;
-    bool codeXorY = std::abs(posNodeLidar[0]) <= std::abs(posNodeLidar[1]);
-    directIdcm.x() = !codeXorY;
-    directIdcm.y() = codeXorY;
+  // Position of the node relative to the angular origin
+  point_t posNodeLidar;
+  if (geom_angular_mode_enabled_flag) {
+    posNodeLidar = quant.scaleEns(node.pos << effectiveNodeSizeLog2);
+    posNodeLidar -= angularOrigin;
+
+    bool directAxis = std::abs(posNodeLidar[0]) <= std::abs(posNodeLidar[1]);
+    directIdcm = false;
+    directIdcm[directAxis] = true;
   }
 
   // Jointly code two points
   if (numPoints == 2 && joint_2pt_idcm_enabled_flag) {
-    auto& cloud = pointCloud;
-    auto ptIdx = node.start;
     // Apply an implicit ordering to the two points, considering only the
     // directly coded axes
-    if (times(cloud[ptIdx + 1], directIdcm) < times(cloud[ptIdx], directIdcm))
-      cloud.swapPoints(ptIdx, ptIdx + 1);
+    if (times(points[1], directIdcm) < times(points[0], directIdcm)) {
+      std::swap(points[0], points[1]);
+      pointCloud.swapPoints(node.start, node.start + 1);
+    }
 
-    encodeOrdered2ptPrefix(pointCloud, ptIdx, directIdcm, nodeSizeLog2Rem);
+    encodeOrdered2ptPrefix(points, directIdcm, nodeSizeLog2Rem);
   }
 
-  if (angularIdcm) {
-    for (int idx = 0; idx < 3; ++idx) {
-      int mask = (1 << nodeSizeLog2[idx]);
-      for (int i = 0; i < nodeSizeLog2[idx] - nodeSizeLog2Rem[idx]; ++i) {
-        mask >>= 1;
-        if (pointCloud[node.start][idx] & mask)
-          posNodeLidar[idx] += mask;
-      }
-      mask >>= 1;
-      posNodeLidar[idx] += mask;
-    }
-    node.laserIndex = findLaser(posNodeLidar, thetaLaser, numLasers);
+  int laserIdx;
+  if (geom_angular_mode_enabled_flag) {
+    auto delta = points[0] - (node.pos << effectiveNodeSizeLog2);
+    delta = (delta >> nodeSizeLog2Rem) << nodeSizeLog2Rem;
+    delta += (1 << nodeSizeLog2Rem) >> 1;
+    delta = quant.scaleEns(delta);
+    laserIdx = findLaser(posNodeLidar + delta, thetaLaser, numLasers);
   }
 
   // code points after planar
-  for (auto idx = node.start; idx < node.start + numPoints; idx++) {
-    if (angularIdcm) {
+  for (auto idx = 0; idx < numPoints; idx++) {
+    if (geom_angular_mode_enabled_flag)
       encodePointPositionAngular(
-        nodeSizeLog2, nodeSizeLog2Rem, pointCloud[idx] >> shiftBits, node,
-        planar, headPos, zLaser, thetaLaser, numLasers);
-    } else
-      encodePointPosition(nodeSizeLog2Rem, pointCloud[idx] >> shiftBits);
+        quant, planar, nodeSizeLog2Rem, posNodeLidar, points[idx], laserIdx,
+        angularOrigin, zLaser, thetaLaser, numLasers);
+    else
+      encodePointPosition(nodeSizeLog2Rem, points[idx]);
   }
 }
 
@@ -1365,17 +1413,18 @@ GeometryOctreeEncoder::encodeDirectPosition(
 void
 GeometryOctreeEncoder::encodeThetaRes(int thetaRes)
 {
-  _arithmeticEncoder->encode(thetaRes == 0 ? 1 : 0, _ctxThetaResIsZero);
+  _arithmeticEncoder->encode(thetaRes != 0, _ctxThetaRes[0]);
+  if (!thetaRes)
+    return;
 
-  if (thetaRes) {
-    _arithmeticEncoder->encode(thetaRes > 0 ? 1 : 0, _ctxThetaResSign);
-    int absThetaRes = std::abs(thetaRes);
-    _arithmeticEncoder->encode(absThetaRes == 1 ? 1 : 0, _ctxThetaResIsOne);
-    if (absThetaRes >= 2)
-      _arithmeticEncoder->encode(absThetaRes == 2 ? 1 : 0, _ctxThetaResIsTwo);
-    if (absThetaRes >= 3)
-      _arithmeticEncoder->encodeExpGolomb(absThetaRes - 3, 1, _ctxThetaResExp);
-  }
+  int absVal = std::abs(thetaRes);
+  _arithmeticEncoder->encode(--absVal > 0, _ctxThetaRes[1]);
+  if (absVal)
+    _arithmeticEncoder->encode(--absVal > 0, _ctxThetaRes[2]);
+  if (absVal)
+    _arithmeticEncoder->encodeExpGolomb(--absVal, 1, _ctxThetaResExp);
+
+  _arithmeticEncoder->encode(thetaRes < 0, _ctxThetaResSign);
 }
 
 //-------------------------------------------------------------------------
@@ -1408,7 +1457,6 @@ encodeGeometryOctree(
   node00.start = uint32_t(0);
   node00.end = uint32_t(pointCloud.getPointCount());
   node00.pos = int32_t(0);
-  node00.neighPattern = 0;
   node00.numSiblingsPlus1 = 8;
   node00.siblingOccupancy = 0;
   node00.qp = 0;
@@ -1421,20 +1469,17 @@ encodeGeometryOctree(
 
   // generate the list of the node size for each level in the tree
   auto lvlNodeSizeLog2 = mkQtBtNodeSizeList(gps, params.qtbt, gbh);
-  auto nodeSizeLog2 = lvlNodeSizeLog2[0];
 
-  const int idcmThreshold = gps.geom_planar_mode_enabled_flag
-    ? gps.geom_planar_idcm_threshold * 127 * 127
-    : 127 * 127 * 127;
+  // rotating mask used to enable idcm
+  uint32_t idcmEnableMaskInit = mkIdcmEnableMask(gps);
 
   //  Lidar angles for planar prediction
-  const int numLasers = gps.geom_angular_num_lidar_lasers();
-  const int* thetaLaser = gps.geom_angular_theta_laser.data();
-  const int* zLaser = gps.geom_angular_z_laser.data();
-  const int* numPhi = gps.geom_angular_num_phi_per_turn.data();
+  const int numLasers = gps.numLasers();
+  const int* thetaLaser = gps.angularTheta.data();
+  const int* zLaser = gps.angularZ.data();
 
   // Lidar position relative to slice origin
-  auto headPos = gps.geomAngularOrigin - gbh.geomBoxOrigin;
+  auto angularOrigin = gbh.geomAngularOrigin(gps);
 
   int deltaAngle = 128 << 18;
   for (int i = 0; i < numLasers - 1; i++) {
@@ -1444,16 +1489,16 @@ encodeGeometryOctree(
   }
 
   MortonMap3D occupancyAtlas;
-  if (gps.neighbour_avail_boundary_log2) {
-    occupancyAtlas.resize(gps.neighbour_avail_boundary_log2);
-    occupancyAtlas.clear(
-      gps.adjacent_child_contextualization_enabled_flag
-      && gps.inferred_direct_coding_mode > 1);
+  if (gps.neighbour_avail_boundary_log2_minus1) {
+    occupancyAtlas.resize(
+      gps.adjacent_child_contextualization_enabled_flag,
+      gps.neighbour_avail_boundary_log2_minus1 + 1);
+    occupancyAtlas.clear();
   }
 
   // the minimum node size is ordinarily 2**0, but may be larger due to
   // early termination for trisoup.
-  int minNodeSizeLog2 = gbh.trisoup_node_size_log2;
+  int minNodeSizeLog2 = gbh.trisoupNodeSizeLog2(gps);
 
   // prune anything smaller than the minimum node size (these won't be coded)
   // NB: this must result in a cubic node at the end of the list
@@ -1477,25 +1522,39 @@ encodeGeometryOctree(
   // generate the qtbt splitting list
   //  - start at the leaf, and work up
   std::vector<int8_t> tree_lvl_partition_list;
-  for (int lvl = maxDepth; lvl > 0; lvl--) {
+  for (int lvl = 0; lvl < maxDepth; lvl++) {
     gbh.tree_lvl_coded_axis_list.push_back(
-      ~nonSplitQtBtAxes(lvlNodeSizeLog2[lvl - 1], lvlNodeSizeLog2[lvl]));
+      ~nonSplitQtBtAxes(lvlNodeSizeLog2[lvl], lvlNodeSizeLog2[lvl + 1]));
+
+    // Conformance: at least one axis must attempt to be coded at each level
+    assert(gbh.tree_lvl_coded_axis_list.back() != 0);
   }
 
   // the node size where quantisation is performed
   Vec3<int> quantNodeSizeLog2 = 0;
+  Vec3<uint32_t> posQuantBitMasks = 0xffffffff;
   int idcmQp = 0;
   int sliceQp = gbh.sliceQp(gps);
   int numLvlsUntilQuantization = 0;
   if (gps.geom_scaling_enabled_flag) {
-    // if an invalid depth is set, use tree height instead
-    if (gbh.geom_octree_qp_offset_depth < 0)
-      gbh.geom_octree_qp_offset_depth = maxDepth;
-    numLvlsUntilQuantization = gbh.geom_octree_qp_offset_depth + 1;
-  }
+    numLvlsUntilQuantization = params.qpOffsetDepth;
 
-  // represents the largest dimension of the current node
-  int nodeMaxDimLog2;
+    // Determine the desired quantisation depth after qtbt is determined
+    if (params.qpOffsetNodeSizeLog2 > 0) {
+      // find the first level that matches the scaling node size
+      for (int lvl = 0; lvl < maxDepth; lvl++) {
+        if (lvlNodeSizeLog2[lvl].min() > params.qpOffsetNodeSizeLog2)
+          continue;
+        numLvlsUntilQuantization = lvl;
+        break;
+      }
+    }
+
+    // if an invalid depth is set, use tree height instead
+    if (numLvlsUntilQuantization < 0)
+      numLvlsUntilQuantization = maxDepth;
+    numLvlsUntilQuantization++;
+  }
 
   // The number of nodes to wait before updating the planar rate.
   // This is to match the prior behaviour where planar is updated once
@@ -1506,28 +1565,39 @@ encodeGeometryOctree(
     gbh.footer.octree_lvl_num_points_minus1.reserve(maxDepth);
 
   for (int depth = 0; depth < maxDepth; depth++) {
+    // The tree terminated early (eg, due to IDCM or quantisation)
+    // Delete any unused arithmetic coders
+    if (fifo.empty()) {
+      ++arithmeticEncoderIt;
+      arithmeticEncoders.erase(arithmeticEncoderIt, arithmeticEncoders.end());
+      break;
+    }
+
     // setyo at the start of each level
     auto fifoCurrLvlEnd = fifo.end();
     int numNodesNextLvl = 0;
     Vec3<int32_t> occupancyAtlasOrigin = 0xffffffff;
 
     // derive per-level node size related parameters
-    auto parentNodeSizeLog2 = nodeSizeLog2;
-    nodeSizeLog2 = lvlNodeSizeLog2[depth];
+    auto nodeSizeLog2 = lvlNodeSizeLog2[depth];
     auto childSizeLog2 = lvlNodeSizeLog2[depth + 1];
-    nodeMaxDimLog2 = nodeSizeLog2.max();
+    // represents the largest dimension of the current node
+    int nodeMaxDimLog2 = nodeSizeLog2.max();
 
     // if one dimension is not split, atlasShift[k] = 0
-    int atlasShift = 7 & ~nonSplitQtBtAxes(parentNodeSizeLog2, nodeSizeLog2);
-    int occupancySkipLevel = nonSplitQtBtAxes(nodeSizeLog2, childSizeLog2);
+    int codedAxesPrevLvl = depth ? gbh.tree_lvl_coded_axis_list[depth - 1] : 7;
+    int codedAxesCurLvl = gbh.tree_lvl_coded_axis_list[depth];
 
     auto pointSortMask = qtBtChildSize(nodeSizeLog2, childSizeLog2);
 
     // Idcm quantisation applies to child nodes before per node qps
     if (--numLvlsUntilQuantization > 0) {
+      // Indicate that the quantisation level has not been reached
+      encoder.encodeNodeQpOffetsPresent(false);
+
       // If planar is enabled, the planar bits are not quantised (since
       // the planar mode is determined before quantisation)
-      quantNodeSizeLog2 = childSizeLog2;
+      quantNodeSizeLog2 = nodeSizeLog2;
       if (gps.geom_planar_mode_enabled_flag)
         quantNodeSizeLog2 -= 1;
 
@@ -1539,19 +1609,23 @@ encodeGeometryOctree(
       idcmQp = gps.geom_base_qp + gps.geom_idcm_qp_offset;
       idcmQp <<= gps.geom_qp_multiplier_log2;
       idcmQp = std::min(idcmQp, minNs * 8);
+      for (int k = 0; k < 3; k++)
+        posQuantBitMasks[k] = (1 << quantNodeSizeLog2[k]) - 1;
     }
 
     // determing a per node QP at the appropriate level
     if (!numLvlsUntilQuantization) {
+      // Indicate that this is the level where per-node QPs are signalled.
+      encoder.encodeNodeQpOffetsPresent(true);
+
       // idcm qps are no longer independent
       idcmQp = 0;
       quantNodeSizeLog2 = nodeSizeLog2;
-      if (!depth)
-        fifo.front().qp = sliceQp;
-      else
-        calculateNodeQps(
-          nodeSizeLog2, sliceQp, gps.geom_qp_multiplier_log2, fifo.begin(),
-          fifoCurrLvlEnd);
+      for (int k = 0; k < 3; k++)
+        posQuantBitMasks[k] = (1 << quantNodeSizeLog2[k]) - 1;
+      calculateNodeQps(
+        params.qpMethod, nodeSizeLog2, sliceQp, gps.geom_qp_multiplier_log2,
+        fifo.begin(), fifoCurrLvlEnd);
     }
 
     // save context state for parallel coding
@@ -1564,6 +1638,10 @@ encodeGeometryOctree(
       encoder = *savedState;
       encoder._arithmeticEncoder = (++arithmeticEncoderIt)->get();
     }
+
+    // reset the idcm eligibility mask at the start of each level to
+    // support multiple streams
+    auto idcmEnableMask = rotateRight(idcmEnableMaskInit, depth);
 
     auto planarDepth = gbh.rootNodeSizeLog2 - nodeSizeLog2;
     encoder.beginOctreeLevel(planarDepth);
@@ -1583,11 +1661,11 @@ encodeGeometryOctree(
       auto effectiveChildSizeLog2 = childSizeLog2 - shiftBits;
 
       // make quantisation work with qtbt and planar.
-      int occupancySkip = occupancySkipLevel;
+      int codedAxesCurNode = codedAxesCurLvl;
       if (shiftBits != 0) {
         for (int k = 0; k < 3; k++) {
           if (effectiveChildSizeLog2[k] < 0)
-            occupancySkip |= (4 >> k);
+            codedAxesCurNode &= ~(4 >> k);
         }
       }
 
@@ -1597,107 +1675,25 @@ encodeGeometryOctree(
           checkDuplicatePoints(pointCloud, node0, pointIdxToDmIdx);
       }
 
-      int occupancyAdjacencyGt0 = 0;
-      int occupancyAdjacencyGt1 = 0;
-      int occupancyAdjacencyUnocc = 0;
+      GeometryNeighPattern gnp{};
+      // The position of the node in the parent's occupancy map
+      int posInParent = 0;
+      posInParent |= (node0.pos[0] & 1) << 2;
+      posInParent |= (node0.pos[1] & 1) << 1;
+      posInParent |= (node0.pos[2] & 1) << 0;
+      posInParent &= codedAxesPrevLvl;
 
-      if (gps.neighbour_avail_boundary_log2) {
+      if (gps.neighbour_avail_boundary_log2_minus1) {
         updateGeometryOccupancyAtlas(
-          node0.pos, atlasShift, fifo, fifoCurrLvlEnd, &occupancyAtlas,
+          node0.pos, codedAxesPrevLvl, fifo, fifoCurrLvlEnd, &occupancyAtlas,
           &occupancyAtlasOrigin);
 
-        GeometryNeighPattern gnp = makeGeometryNeighPattern(
+        gnp = makeGeometryNeighPattern(
           gps.adjacent_child_contextualization_enabled_flag, node0.pos,
-          atlasShift, occupancyAtlas);
-
-        node0.neighPattern = gnp.neighPattern;
-        occupancyAdjacencyGt0 = gnp.adjacencyGt0;
-        occupancyAdjacencyGt1 = gnp.adjacencyGt1;
-        occupancyAdjacencyUnocc = gnp.adjacencyUnocc;
-      }
-
-      int contextAngle = -1;
-      int contextAnglePhiX = -1;
-      int contextAnglePhiY = -1;
-      if (gps.geom_angular_mode_enabled_flag) {
-        contextAngle = determineContextAngleForPlanar(
-          node0, headPos, nodeSizeLog2, zLaser, thetaLaser, numLasers,
-          deltaAngle, encoder._phiZi, encoder._phiBuffer.data(),
-          &contextAnglePhiX, &contextAnglePhiY);
-      }
-
-      OctreeNodePlanar planar;
-      if (!isLeafNode(effectiveNodeSizeLog2) || node0.idcmEligible) {
-        // planar eligibility
-        bool planarEligible[3] = {false, false, false};
-        if (gps.geom_planar_mode_enabled_flag) {
-          // update the plane rate depending on the occupancy and local density
-          auto occupancy = node0.siblingOccupancy;
-          auto numSiblings = node0.numSiblingsPlus1;
-          if (!nodesBeforePlanarUpdate--) {
-            encoder._planar.updateRate(occupancy, numSiblings);
-            nodesBeforePlanarUpdate = numSiblings - 1;
-          }
-          encoder._planar.isEligible(planarEligible);
-
-          if (gps.geom_angular_mode_enabled_flag) {
-            if (contextAngle != -1)
-              planarEligible[2] = true;
-            planarEligible[0] = (contextAnglePhiX != -1);
-            planarEligible[1] = (contextAnglePhiY != -1);
-          }
-
-          for (int k = 0; k < 3; k++)
-            planarEligible[k] &= (~occupancySkip >> (2 - k)) & 1;
-        }
-
-        int planarProb[3] = {127, 127, 127};
-        // determine planarity if eligible
-        if (planarEligible[0] || planarEligible[1] || planarEligible[2])
-          encoder.determinePlanarMode(
-            pointCloud, planarEligible, effectiveNodeSizeLog2, node0, planar,
-            node0.neighPattern, planarProb, contextAngle, contextAnglePhiX,
-            contextAnglePhiY);
-
-        node0.idcmEligible &=
-          planarProb[0] * planarProb[1] * planarProb[2] <= idcmThreshold;
-      }
-
-      if (node0.idcmEligible) {
-        auto mode = canEncodeDirectPosition(
-          gps.geom_unique_points_flag, node0, pointCloud);
-
-        encoder.encodeIsIdcm(mode);
-
-        if (mode != DirectMode::kUnavailable) {
-          int idcmShiftBits = shiftBits;
-          auto idcmSize = effectiveNodeSizeLog2;
-
-          if (mode != DirectMode::kUnavailable && idcmQp) {
-            node0.qp = idcmQp;
-            idcmSize = nodeSizeLog2 - QuantizerGeom::qpShift(idcmQp);
-            geometryQuantization(pointCloud, node0, quantNodeSizeLog2);
-          }
-
-          encoder.encodeDirectPosition(
-            mode, gps.geom_unique_points_flag, gps.joint_2pt_idcm_enabled_flag,
-            idcmSize, idcmShiftBits, node0, planar, pointCloud,
-            gps.geom_angular_mode_enabled_flag, headPos, zLaser, thetaLaser,
-            numLasers);
-
-          // inverse quantise any quantised positions
-          geometryScale(pointCloud, node0, quantNodeSizeLog2);
-
-          // point reordering to match decoder's order
-          for (auto idx = node0.start; idx < node0.end; idx++)
-            pointIdxToDmIdx[idx] = nextDmIdx++;
-
-          // NB: by definition, this is the only child node present
-          if (gps.inferred_direct_coding_mode <= 1)
-            assert(node0.numSiblingsPlus1 == 1);
-
-          continue;
-        }
+          codedAxesPrevLvl, codedAxesCurLvl, occupancyAtlas);
+      } else {
+        gnp.neighPattern =
+          neighPatternFromOccupancy(posInParent, node0.siblingOccupancy);
       }
 
       // split the current node into 8 children
@@ -1725,17 +1721,117 @@ encodeGeometryOctree(
         }
       }
 
+      int contextAngle = -1;
+      int contextAnglePhiX = -1;
+      int contextAnglePhiY = -1;
+      if (gps.geom_angular_mode_enabled_flag) {
+        contextAngle = determineContextAngleForPlanar(
+          node0, nodeSizeLog2, angularOrigin, zLaser, thetaLaser, numLasers,
+          deltaAngle, encoder._phiZi, encoder._phiBuffer.data(),
+          &contextAnglePhiX, &contextAnglePhiY, posQuantBitMasks);
+      }
+
+      if (gps.geom_planar_mode_enabled_flag) {
+        // update the plane rate depending on the occupancy and local density
+        auto occupancy = node0.siblingOccupancy;
+        auto numSiblings = node0.numSiblingsPlus1;
+        if (!nodesBeforePlanarUpdate--) {
+          encoder._planar.updateRate(occupancy, numSiblings);
+          nodesBeforePlanarUpdate = numSiblings - 1;
+        }
+      }
+
+      OctreeNodePlanar planar;
+      if (!isLeafNode(effectiveNodeSizeLog2)) {
+        // planar eligibility
+        bool planarEligible[3] = {false, false, false};
+        if (gps.geom_planar_mode_enabled_flag) {
+          encoder._planar.isEligible(planarEligible);
+          if (gps.geom_angular_mode_enabled_flag) {
+            if (contextAngle != -1)
+              planarEligible[2] = true;
+            planarEligible[0] = (contextAnglePhiX != -1);
+            planarEligible[1] = (contextAnglePhiY != -1);
+          }
+
+          for (int k = 0; k < 3; k++)
+            planarEligible[k] &= (codedAxesCurNode >> (2 - k)) & 1;
+        }
+
+        // determine planarity if eligible
+        if (planarEligible[0] || planarEligible[1] || planarEligible[2])
+          encoder.determinePlanarMode(
+            gps.adjacent_child_contextualization_enabled_flag, occupancy,
+            planarEligible, posInParent, gnp, node0, planar, contextAngle,
+            contextAnglePhiX, contextAnglePhiY);
+      }
+
+      // At the scaling depth, it is possible for a node that has previously
+      // been marked as being eligible for idcm to be fully quantised due
+      // to the choice of QP.  There is therefore nothing to code with idcm.
+      if (isLeafNode(effectiveNodeSizeLog2))
+        node0.idcmEligible = false;
+
+      if (node0.idcmEligible) {
+        // todo(df): this is pessimistic in the presence of idcm quantisation,
+        // since that is eligible may only meet the point count constraint
+        // after quantisation, which is performed after the decision is taken.
+        auto mode = canEncodeDirectPosition(
+          gps.geom_unique_points_flag, node0, pointCloud);
+
+        encoder.encodeIsIdcm(mode);
+
+        if (mode != DirectMode::kUnavailable) {
+          int idcmShiftBits = shiftBits;
+          auto idcmSize = effectiveNodeSizeLog2;
+
+          if (idcmQp) {
+            node0.qp = idcmQp;
+            idcmShiftBits = QuantizerGeom::qpShift(idcmQp);
+            idcmSize = nodeSizeLog2 - idcmShiftBits;
+            geometryQuantization(pointCloud, node0, quantNodeSizeLog2);
+
+            if (gps.geom_unique_points_flag)
+              checkDuplicatePoints(pointCloud, node0, pointIdxToDmIdx);
+          }
+
+          encoder.encodeDirectPosition(
+            gps.geom_unique_points_flag, gps.joint_2pt_idcm_enabled_flag,
+            gps.geom_angular_mode_enabled_flag, mode, posQuantBitMasks,
+            idcmSize, idcmShiftBits, node0, planar, pointCloud, angularOrigin,
+            zLaser, thetaLaser, numLasers);
+
+          // inverse quantise any quantised positions
+          geometryScale(pointCloud, node0, quantNodeSizeLog2);
+
+          // point reordering to match decoder's order
+          for (auto idx = node0.start; idx < node0.end; idx++)
+            pointIdxToDmIdx[idx] = nextDmIdx++;
+
+          // NB: by definition, this is the only child node present
+          if (gps.inferred_direct_coding_mode <= 1)
+            assert(node0.numSiblingsPlus1 == 1);
+
+          // This node has no children, ensure that future nodes avoid
+          // accessing stale child occupancy data.
+          if (gps.adjacent_child_contextualization_enabled_flag)
+            updateGeometryOccupancyAtlasOccChild(
+              node0.pos, 0, &occupancyAtlas);
+
+          continue;
+        }
+      }
+
       // when all points are quantized to a single point
       if (!isLeafNode(effectiveNodeSizeLog2)) {
         // encode child occupancy map
         assert(occupancy > 0);
-        assert(occupancySkip != 7);
 
         // planar mode for current node
         // mask to be used for the occupancy coding
         // (bit =1 => occupancy bit not coded due to not belonging to the plane)
         int planarMask[3] = {0, 0, 0};
-        maskPlanar(planar, planarMask, occupancySkip);
+        maskPlanar(planar, planarMask, codedAxesCurNode);
 
         // generate intra prediction
         bool intraPredUsed = !(planarMask[0] | planarMask[1] | planarMask[2]);
@@ -1743,25 +1839,26 @@ encodeGeometryOctree(
         int occupancyPrediction = 0;
         if (
           nodeMaxDimLog2 < gps.intra_pred_max_node_size_log2
-          && gps.neighbour_avail_boundary_log2 > 0 && intraPredUsed) {
+          && gps.neighbour_avail_boundary_log2_minus1 > 0 && intraPredUsed) {
           predictGeometryOccupancyIntra(
-            occupancyAtlas, node0.pos, atlasShift, &occupancyIsPredicted,
+            occupancyAtlas, node0.pos, codedAxesPrevLvl, &occupancyIsPredicted,
             &occupancyPrediction);
         }
 
         encoder.encodeOccupancy(
-          node0.neighPattern, occupancy, occupancyIsPredicted,
-          occupancyPrediction, occupancyAdjacencyGt0, occupancyAdjacencyGt1,
-          occupancyAdjacencyUnocc, planarMask[0], planarMask[1], planarMask[2],
+          gnp, occupancy, occupancyIsPredicted, occupancyPrediction,
+          planarMask[0], planarMask[1], planarMask[2],
           planar.planarPossible & 1, planar.planarPossible & 2,
           planar.planarPossible & 4);
       }
 
-      // update atlas for advanced neighbours
-      if (gps.neighbour_avail_boundary_log2) {
+      // update atlas for child neighbours
+      // NB: the child occupancy atlas must be updated even if the current
+      //     node has no occupancy coded in order to clear any stale state in
+      //     the atlas.
+      if (gps.adjacent_child_contextualization_enabled_flag)
         updateGeometryOccupancyAtlasOccChild(
           node0.pos, occupancy, &occupancyAtlas);
-      }
 
       // Leaf nodes are immediately coded.  No further splitting occurs.
       if (isLeafNode(effectiveChildSizeLog2)) {
@@ -1818,9 +1915,9 @@ encodeGeometryOctree(
 
         child.qp = node0.qp;
         // only shift position if an occupancy bit was coded for the axis
-        child.pos[0] = (node0.pos[0] << !(occupancySkipLevel & 4)) + x;
-        child.pos[1] = (node0.pos[1] << !(occupancySkipLevel & 2)) + y;
-        child.pos[2] = (node0.pos[2] << !(occupancySkipLevel & 1)) + z;
+        child.pos[0] = (node0.pos[0] << !!(codedAxesCurLvl & 4)) + x;
+        child.pos[1] = (node0.pos[1] << !!(codedAxesCurLvl & 2)) + y;
+        child.pos[2] = (node0.pos[2] << !!(codedAxesCurLvl & 1)) + z;
 
         child.start = childPointsStartIdx;
         childPointsStartIdx += childCounts[i];
@@ -1830,17 +1927,15 @@ encodeGeometryOctree(
         child.laserIndex = node0.laserIndex;
 
         child.idcmEligible = isDirectModeEligible(
-          gps.inferred_direct_coding_mode, nodeMaxDimLog2, node0, child);
+          gps.inferred_direct_coding_mode, nodeMaxDimLog2, gnp.neighPattern,
+          node0, child);
+
+        if (child.idcmEligible) {
+          child.idcmEligible &= idcmEnableMask & 1;
+          idcmEnableMask = rotateRight(idcmEnableMask, 1);
+        }
 
         numNodesNextLvl++;
-
-        // NB: when neighbourAvailBoundaryLog2 is set equal to 0, an alternative
-        //     implementation is used to calculate sibling neighPattern.
-        if (!gps.neighbour_avail_boundary_log2) {
-          updateGeometryNeighState(
-            true, fifo.end(), numNodesNextLvl, child, i, node0.neighPattern,
-            occupancy);
-        }
       }
     }
 
@@ -1864,10 +1959,9 @@ encodeGeometryOctree(
   //  - inverse quantise the point cloud
   // todo(df): this does not yet support inverse quantisation of node.pos
   if (nodesRemaining) {
-    nodeSizeLog2 = lvlNodeSizeLog2[maxDepth];
+    auto nodeSizeLog2 = lvlNodeSizeLog2[maxDepth];
     for (auto& node : fifo) {
-      for (int k = 0; k < 3; k++)
-        node.pos[k] <<= nodeSizeLog2[k];
+      node.pos <<= nodeSizeLog2;
       geometryScale(pointCloud, node, quantNodeSizeLog2);
     }
     *nodesRemaining = std::move(fifo);

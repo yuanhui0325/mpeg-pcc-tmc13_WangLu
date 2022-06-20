@@ -40,6 +40,7 @@
 
 #include "PCCMisc.h"
 #include "geometry_params.h"
+#include "quantization.h"
 #include "tables.h"
 
 namespace pcc {
@@ -221,93 +222,35 @@ mapGeometryOccupancyInv(uint8_t occupancy, uint8_t neighPattern)
 }
 
 //============================================================================
-// Update the neighbour pattern flags for a node and the 'left' neighbour on
-// each axis.  This update should be applied to each newly inserted node.
+// Derive the neighbour pattern for the three siblings of a node
+// from the parent's occupancy byte.
 //
-// @param siblingRestriction limits neighbours to direct siblings of child
+// @param pos        index of the node in the occupancy scan order.
+// @param occupancy  occupancy byte of the parent node
+//
+// @returns the six-neighbour pattern.
 
-void
-updateGeometryNeighState(
-  bool siblingRestriction,
-  const ringbuf<PCCOctree3Node>::iterator& bufEnd,
-  int64_t numNodesNextLvl,
-  PCCOctree3Node& child,
-  int childIdx,
-  uint8_t neighPattern,
-  uint8_t parentOccupancy)
+int
+neighPatternFromOccupancy(int pos, int occupancy)
 {
-  int64_t midx;
-  if (!siblingRestriction) {
-    midx = child.mortonIdx = mortonAddr(child.pos);
-  }
-
-  static const struct {
-    int childIdxBitPos;
-    int axis;
-    int patternFlagUs;
-    int patternFlagThem;
-  } neighParamMap[] = {
-    {4, 2, 1 << 1, 1 << 0},  // x
-    {2, 1, 1 << 2, 1 << 3},  // y
-    {1, 0, 1 << 4, 1 << 5},  // z
-  };
-
-  for (const auto& param : neighParamMap) {
-    // skip expensive check if parent's flags indicate adjacent neighbour
-    // is not present.
-    if ((childIdx & param.childIdxBitPos) == 0) {
-      // $axis co-ordinate = 0
-      if (parentOccupancy & (1 << (childIdx + param.childIdxBitPos)))
-        child.neighPattern |= param.patternFlagThem;
-
-      if (!(neighPattern & param.patternFlagUs))
-        continue;
-    } else {
-      if (parentOccupancy & (1 << (childIdx - param.childIdxBitPos)))
-        child.neighPattern |= param.patternFlagUs;
-
-      // no external search is required for $axis co-ordinate = 1
-      continue;
-    }
-
-    if (siblingRestriction)
-      continue;
-
-    // calculate the morton address of the 'left' neighbour,
-    // the delta is then used as the starting position for a search
-    int64_t mortonIdxNeigh =
-      morton3dAxisDec(midx, param.axis) & ~0x8000000000000000ull;
-    int64_t mortonDelta = midx - mortonIdxNeigh;
-
-    if (mortonDelta < 0) {
-      // no neighbour due to being in zero-th col/row/plane
-      continue;
-    }
-
-    // NB: fifo already contains current node, no point searching it
-    auto posEnd = bufEnd;
-    std::advance(posEnd, -1);
-
-    auto posStart = bufEnd;
-    std::advance(posStart, -std::min(numNodesNextLvl, mortonDelta + 2));
-
-    auto found = std::lower_bound(
-      posStart, posEnd, mortonIdxNeigh,
-      [](const PCCOctree3Node& node, int64_t mortonIdx) {
-        return node.mortonIdx < mortonIdx;
-      });
-
-    // NB: found is always valid (see posEnd) => can skip check.
-    if (found->mortonIdx != mortonIdxNeigh) {
-      // neighbour isn't present => must have been empty
-      continue;
-    }
-
-    // update both node's neighbour pattern
-    // NB: neighours being present implies occupancy
-    child.neighPattern |= param.patternFlagUs;
-    found->neighPattern |= param.patternFlagThem;
-  }
+  /* The following maps the three neighbours of a child at position pos
+   * to form a six-neighbour pattern from occupancy:
+   *    pos | occupancy | neighpat
+   *    xyz |  76543210 |  udfblr
+   *    000 |  ...r.fu. |  1.2..4
+   *    001 |  ..r.f..d |  .03..5
+   *    010 |  .r..u..b |  3..0.6
+   *    011 |  r....db. |  .2.1.7
+   *    100 |  .fu....l |  5.6.0.
+   *    101 |  f..d..l. |  .47.1.
+   *    110 |  u..b.l.. |  7..42.
+   *    111 |  .db.l... |  .6.53.
+   */
+  int neighPat = 0;
+  neighPat |= ((occupancy >> (pos ^ 4)) & 1) << (0 + ((pos >> 2) & 1));   // x
+  neighPat |= ((occupancy >> (pos ^ 2)) & 1) << (2 + ((~pos >> 1) & 1));  // y
+  neighPat |= ((occupancy >> (pos ^ 1)) & 1) << (4 + ((~pos >> 0) & 1));  // z
+  return neighPat;
 }
 
 //============================================================================
@@ -359,46 +302,63 @@ CtxMapOctreeOccupancy::CtxMapOctreeOccupancy()
   b[6] = map->b6;
   b[7] = map->b7;
 
-  using namespace std;
-  fill(begin(map->b0), end(map->b0), 127);
-  fill(begin(map->b1), end(map->b1), 127);
-  fill(begin(map->b2), end(map->b2), 127);
-  fill(begin(map->b3), end(map->b3), 127);
-  fill(begin(map->b4), end(map->b4), 127);
-  fill(begin(map->b5), end(map->b5), 127);
-  fill(begin(map->b6), end(map->b6), 127);
-  fill(begin(map->b7), end(map->b7), 127);
+  using std::begin;
+  using std::end;
+  std::fill(begin(map->b0), end(map->b0), 127);
+  std::fill(begin(map->b1), end(map->b1), 127);
+  std::fill(begin(map->b2), end(map->b2), 127);
+  std::fill(begin(map->b3), end(map->b3), 127);
+  std::fill(begin(map->b4), end(map->b4), 127);
+  std::fill(begin(map->b5), end(map->b5), 127);
+  std::fill(begin(map->b6), end(map->b6), 127);
+  std::fill(begin(map->b7), end(map->b7), 127);
+}
+
+//============================================================================
+
+uint32_t
+mkIdcmEnableMask(const GeometryParameterSet& gps)
+{
+  if (!gps.inferred_direct_coding_mode)
+    return 0;
+
+  // intense IDCM requires idcm to be enabled all the time
+  if (gps.inferred_direct_coding_mode != 1)
+    return 0xffffffff;
+
+  // if planar is disabled, there is no control over the rate
+  if (!gps.geom_planar_mode_enabled_flag)
+    return 0xffffffff;
+
+  int mask = 0, acc = 0;
+  for (int i = 0; i < 32; i++) {
+    acc += gps.geom_idcm_rate_minus1 + 1;
+    mask |= (acc >= 32) << i;
+    acc &= 0x1f;
+  }
+
+  return mask;
 }
 
 //============================================================================
 // determine if a 222 block is planar
 
 void
-isPlanarNode(
-  const PCCPointSet3& pointCloud,
-  const PCCOctree3Node& node0,
-  const Vec3<int>& nodeSizeLog2Minus1,
-  uint8_t& planarMode,
-  uint8_t& planePosBits,
-  const bool planarEligible[3])
+setPlanesFromOccupancy(int occupancy, OctreeNodePlanar& planar)
 {
-  const point_t occupMask{planarEligible[0] << nodeSizeLog2Minus1[0],
-                          planarEligible[1] << nodeSizeLog2Minus1[1],
-                          planarEligible[2] << nodeSizeLog2Minus1[2]};
+  uint8_t plane0 = 0;
+  plane0 |= !!(occupancy & 0x0f) << 0;
+  plane0 |= !!(occupancy & 0x33) << 1;
+  plane0 |= !!(occupancy & 0x55) << 2;
 
-  point_t occup = 0;
-  // find occupancy N xyz-planes
-  for (int k = node0.start; k < node0.end; k++) {
-    occup[0] |= planarEligible[0] << bool(pointCloud[k][0] & occupMask[0]);
-    occup[1] |= planarEligible[1] << bool(pointCloud[k][1] & occupMask[1]);
-    occup[2] |= planarEligible[2] << bool(pointCloud[k][2] & occupMask[2]);
-  }
+  uint8_t plane1 = 0;
+  plane1 |= !!(occupancy & 0xf0) << 0;
+  plane1 |= !!(occupancy & 0xcc) << 1;
+  plane1 |= !!(occupancy & 0xaa) << 2;
 
-  // determine planar
-  planarMode =
-    (occup[0] != 3) | ((occup[1] != 3) << 1) | ((occup[2] != 3) << 2);
-  planePosBits =
-    (occup[0] == 2) | ((occup[1] == 2) << 1) | ((occup[2] == 2) << 2);
+  // Only planar if a single plane normal to an axis is occupied
+  planar.planarMode = plane0 ^ plane1;
+  planar.planePosBits = planar.planarMode & plane1;
 }
 
 //============================================================================
@@ -447,12 +407,12 @@ OctreePlanarBuffer::resize(Vec3<int> numBufferRows)
   if (maskC < numBufferRows[2])
     numBufferRows[2] = maskC + 1;
 
-  // NB: based upon the expected max buffer size of 32k, just allocate the
+  // NB: based upon the expected max buffer size of 3*14k, just allocate the
   //     maximum buffer size.
   int size = numBufferRows[0] + numBufferRows[1] + numBufferRows[2];
   _buf.clear();
   _buf.reserve(rowSize * 3 * (maskC + 1));
-  _buf.resize(rowSize * size, Elmt{0, -2, 0});
+  _buf.resize(rowSize * size, Elmt{0, -2});
 
   // NB: the flat backing buffer is cast with a row stride for access
   _col[0] = reinterpret_cast<Row*>(&_buf.front());
@@ -598,11 +558,8 @@ OctreePlanarState::operator=(OctreePlanarState&& rhs)
 // directional mask depending on the planarity
 
 int
-maskPlanarX(const OctreeNodePlanar& planar, bool implicitSkip)
+maskPlanarX(const OctreeNodePlanar& planar)
 {
-  if (implicitSkip)
-    return 0xf0;
-
   if ((planar.planarMode & 1) == 0)
     return 0;
 
@@ -612,11 +569,8 @@ maskPlanarX(const OctreeNodePlanar& planar, bool implicitSkip)
 //----------------------------------------------------------------------------
 
 int
-maskPlanarY(const OctreeNodePlanar& planar, bool implicitSkip)
+maskPlanarY(const OctreeNodePlanar& planar)
 {
-  if (implicitSkip)
-    return 0xcc;
-
   if ((planar.planarMode & 2) == 0)
     return 0;
 
@@ -626,13 +580,8 @@ maskPlanarY(const OctreeNodePlanar& planar, bool implicitSkip)
 //----------------------------------------------------------------------------
 
 int
-maskPlanarZ(const OctreeNodePlanar& planar, bool implicitSkip)
+maskPlanarZ(const OctreeNodePlanar& planar)
 {
-  // QTBT does not split in this direction
-  //   => infer the mask low for occupancy bit coding
-  if (implicitSkip)
-    return 0xaa;
-
   if ((planar.planarMode & 4) == 0)
     return 0;
 
@@ -643,19 +592,20 @@ maskPlanarZ(const OctreeNodePlanar& planar, bool implicitSkip)
 
 // three direction mask
 void
-maskPlanar(OctreeNodePlanar& planar, int mask[3], const int occupancySkip)
+maskPlanar(OctreeNodePlanar& planar, int mask[3], int codedAxes)
 {
-  static const uint8_t kPossibleMask[3] = {6, 5, 3};
-  for (int k = 0; k <= 2; k++)
-    if (occupancySkip & (4 >> k)) {
-      planar.planarPossible = planar.planarPossible | (1 << k);
-      planar.planePosBits = planar.planePosBits & kPossibleMask[k];
-      planar.planarMode = planar.planarMode | (1 << k);
+  for (int k = 0; k <= 2; k++) {
+    // QTBT does not split in this direction
+    //   => infer the mask low for occupancy bit coding
+    if (!(codedAxes & (4 >> k))) {
+      planar.planePosBits &= ~(1 << k);
+      planar.planarMode |= 1 << k;
     }
+  }
 
-  mask[0] = maskPlanarX(planar, occupancySkip & 4);
-  mask[1] = maskPlanarY(planar, occupancySkip & 2);
-  mask[2] = maskPlanarZ(planar, occupancySkip & 1);
+  mask[0] = maskPlanarX(planar);
+  mask[1] = maskPlanarY(planar);
+  mask[2] = maskPlanarZ(planar);
 }
 
 //----------------------------------------------------------------------------
@@ -663,9 +613,9 @@ maskPlanar(OctreeNodePlanar& planar, int mask[3], const int occupancySkip)
 
 int
 determineContextAngleForPlanar(
-  PCCOctree3Node& child,
-  const Vec3<int>& headPos,
-  Vec3<int> childSizeLog2,
+  PCCOctree3Node& node,
+  const Vec3<int>& nodeSizeLog2,
+  const Vec3<int>& angularOrigin,
   const int* zLaser,
   const int* thetaLaser,
   const int numLasers,
@@ -673,24 +623,28 @@ determineContextAngleForPlanar(
   const AzimuthalPhiZi& phiZi,
   int* phiBuffer,
   int* contextAnglePhiX,
-  int* contextAnglePhiY)
+  int* contextAnglePhiY,
+  Vec3<uint32_t> quantMasks)
 {
-  Vec3<int64_t> absPos = {child.pos[0] << childSizeLog2[0],
-                          child.pos[1] << childSizeLog2[1],
-                          child.pos[2] << childSizeLog2[2]};
+  Vec3<int> nodePos = node.pos << nodeSizeLog2;
+  Vec3<int> midNode = (1 << nodeSizeLog2) >> 1;
+  Vec3<int> nodeSize = 1 << nodeSizeLog2;
+
+  if (node.qp) {
+    OctreeAngPosScaler quant(node.qp, quantMasks);
+    nodePos = quant.scaleNs(nodePos);
+    midNode = quant.scaleNs(midNode);
+    nodeSize = quant.scaleNs(nodeSize);
+  }
 
   // eligibility
-  Vec3<int64_t> midNode = {1 << (childSizeLog2[0] ? childSizeLog2[0] - 1 : 0),
-                           1 << (childSizeLog2[1] ? childSizeLog2[1] - 1 : 0),
-                           1 << (childSizeLog2[2] ? childSizeLog2[2] - 1 : 0)};
-  uint64_t xLidar =
-    std::abs(((absPos[0] - headPos[0] + midNode[0]) << 8) - 128);
-  uint64_t yLidar =
-    std::abs(((absPos[1] - headPos[1] + midNode[1]) << 8) - 128);
+  auto nodePosLidar = nodePos - angularOrigin;
+  uint64_t xLidar = std::abs(((nodePosLidar[0] + midNode[0]) << 8) - 128);
+  uint64_t yLidar = std::abs(((nodePosLidar[1] + midNode[1]) << 8) - 128);
 
   uint64_t rL1 = (xLidar + yLidar) >> 1;
   uint64_t deltaAngleR = deltaAngle * rL1;
-  if (deltaAngleR <= (midNode[2] << 26))
+  if (numLasers > 1 && deltaAngleR <= uint64_t(midNode[2]) << 26)
     return -1;
 
   // determine inverse of r  (1/sqrt(r2) = irsqrt(r2))
@@ -698,26 +652,28 @@ determineContextAngleForPlanar(
   uint64_t rInv = irsqrt(r2);
 
   // determine non-corrected theta
-  int64_t zLidar = ((absPos[2] - headPos[2] + midNode[2]) << 1) - 1;
+  int64_t zLidar = ((nodePosLidar[2] + midNode[2]) << 1) - 1;
   int64_t theta = zLidar * rInv;
   int theta32 = theta >= 0 ? theta >> 15 : -((-theta) >> 15);
 
   // determine laser
-  int laserIndex = int(child.laserIndex);
-  if (laserIndex == 255 || deltaAngleR <= (midNode[2] << (26 + 2))) {
+  int laserIndex = int(node.laserIndex);
+  if (numLasers == 1)
+    laserIndex = 0;
+  else if (laserIndex == 255 || deltaAngleR <= uint64_t(midNode[2]) << 28) {
     auto end = thetaLaser + numLasers - 1;
     auto it = std::upper_bound(thetaLaser + 1, end, theta32);
     if (theta32 - *std::prev(it) <= *it - theta32)
       --it;
 
     laserIndex = std::distance(thetaLaser, it);
-    child.laserIndex = uint8_t(laserIndex);
+    node.laserIndex = uint8_t(laserIndex);
   }
 
   // -- PHI  --
   //angles
-  int posx = absPos[0] - headPos[0];
-  int posy = absPos[1] - headPos[1];
+  int posx = nodePosLidar[0];
+  int posy = nodePosLidar[1];
   int phiNode = iatan2(posy + midNode[1], posx + midNode[0]);
   int phiNode0 = iatan2(posy, posx);
 
@@ -730,7 +686,7 @@ determineContextAngleForPlanar(
   if (predPhi != 0x80000000) {
     // elementary shift predictor
     int Nshift =
-      ((predPhi - phiNode) * phiZi.invDelta(laserIndex) + 536870912) >> 30;
+      ((predPhi - phiNode) * phiZi.invDelta(laserIndex) + (1 << 29)) >> 30;
     predPhi -= phiZi.delta(laserIndex) * Nshift;
 
     // ctx azimutal x or y
@@ -742,9 +698,7 @@ determineContextAngleForPlanar(
     angleR = std::abs(angleR);
     if (angleL > angleR) {
       contextAnglePhi++;
-      int temp = angleL;
-      angleL = angleR;
-      angleR = temp;
+      std::swap(angleL, angleR);
     }
     if (angleR > (angleL << 2))
       contextAnglePhi += 4;
@@ -760,7 +714,7 @@ determineContextAngleForPlanar(
   int64_t hr = zLaser[laserIndex] * rInv;
   thetaLaserDelta += hr >= 0 ? -(hr >> 17) : ((-hr) >> 17);
 
-  int64_t zShift = (rInv << childSizeLog2[2]) >> 20;
+  int64_t zShift = (rInv * nodeSize[2]) >> 20;
   int thetaLaserDeltaBot = thetaLaserDelta + zShift;
   int thetaLaserDeltaTop = thetaLaserDelta - zShift;
   int contextAngle = thetaLaserDelta >= 0 ? 0 : 1;
@@ -777,6 +731,9 @@ determineContextAngleForPlanar(
 int
 findLaser(pcc::point_t point, const int* thetaList, const int numTheta)
 {
+  if (numTheta == 1)
+    return 0;
+
   int64_t xLidar = int64_t(point[0]) << 8;
   int64_t yLidar = int64_t(point[1]) << 8;
   int64_t rInv = irsqrt(xLidar * xLidar + yLidar * yLidar);

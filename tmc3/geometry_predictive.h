@@ -37,8 +37,7 @@
 
 #include <cmath>
 #include <cstdint>
-#define  _USE_MATH_DEFINES
-#include "math.h"
+
 #include "entropy.h"
 #include "PCCMath.h"
 #include "hls.h"
@@ -57,9 +56,11 @@ struct GPredicter {
   };
 
   int32_t index[3];
+  int pgeom_min_radius;
 
   bool isValid(Mode mode);
-  Vec3<int32_t> predict(const Vec3<int32_t>* points, Mode mode);
+
+  Vec3<int32_t> predict(const Vec3<int32_t>* points, Mode mode, bool angular);
 };
 
 //============================================================================
@@ -82,28 +83,27 @@ public:
 protected:
   AdaptiveBitModel _ctxNumChildren[3];
   AdaptiveBitModel _ctxPredMode[3];
-  AdaptiveBitModel _ctxIsZero[3];
+  AdaptiveBitModel _ctxResGt0[3];
   AdaptiveBitModel _ctxSign[3];
-  AdaptiveBitModel _ctxNumBits[12][3][31];
+  AdaptiveBitModel _ctxNumBits[5][3][31];
   AdaptiveBitModel _ctxNumDupPointsGt0;
   AdaptiveBitModel _ctxNumDupPoints;
 
-  AdaptiveBitModel _ctxIsZero2[3];
-  AdaptiveBitModel _ctxIsOne2[3];
+  AdaptiveBitModel _ctxResidual2GtN[2][3];
   AdaptiveBitModel _ctxSign2[3];
-  AdaptiveBitModel _ctxEG2[3];
+  AdaptiveBitModel _ctxEG2Prefix[3][5];
+  AdaptiveBitModel _ctxEG2Suffix[3][4];
 
-  AdaptiveBitModel _ctxResidual2[3][15];
-
-  AdaptiveBitModel _ctxQpOffsetIsZero;
+  AdaptiveBitModel _ctxQpOffsetAbsGt0;
   AdaptiveBitModel _ctxQpOffsetSign;
   AdaptiveBitModel _ctxQpOffsetAbsEgl;
 
-  AdaptiveBitModel _ctxIsZeroPhi;
-  AdaptiveBitModel _ctxIsOnePhi;
+  AdaptiveBitModel _ctxPhiGtN[2];
   AdaptiveBitModel _ctxSignPhi;
   AdaptiveBitModel _ctxEGPhi;
-  AdaptiveBitModel _ctxResidualPhi[15];
+  AdaptiveBitModel _ctxResidualPhi[7];
+
+  AdaptiveBitModel _ctxEndOfTrees;
 };
 
 //----------------------------------------------------------------------------
@@ -120,9 +120,17 @@ PredGeomContexts::reset()
 template<typename LookupFn>
 GPredicter
 makePredicter(
-  int32_t curNodeIdx, GPredicter::Mode mode, LookupFn nodeIdxToParentIdx)
+  int32_t curNodeIdx,
+  GPredicter::Mode mode,
+  int minRadius,
+  LookupFn nodeIdxToParentIdx)
 {
+  if (mode == GPredicter::None)
+    mode = GPredicter::Delta;
+
   GPredicter predIdx;
+  predIdx.pgeom_min_radius = minRadius;
+
   switch (mode) {
   default:
   case GPredicter::None:
@@ -155,11 +163,24 @@ GPredicter::isValid(GPredicter::Mode mode)
 //============================================================================
 
 inline Vec3<int32_t>
-GPredicter::predict(const Vec3<int32_t>* points, GPredicter::Mode mode)
+GPredicter::predict(
+  const Vec3<int32_t>* points, GPredicter::Mode mode, bool angular)
 {
   Vec3<int32_t> pred;
   switch (mode) {
-  case GPredicter::None: pred = 0; break;
+  case GPredicter::None: {
+    pred = 0;
+
+    if (angular)
+      pred[0] = pgeom_min_radius;
+
+    if (this->index[0] >= 0 && angular) {
+      const auto& p0 = points[this->index[0]];
+      pred[1] = p0[1];
+      pred[2] = p0[2];
+    }
+    break;
+  }
 
   case GPredicter::Delta: {
     pred = points[this->index[0]];
@@ -191,9 +212,9 @@ class SphericalToCartesian {
 public:
   SphericalToCartesian(const GeometryParameterSet& gps)
     : log2ScaleRadius(gps.geom_angular_radius_inv_scale_log2)
-    , log2ScalePhi(gps.geom_angular_azimuth_scale_log2)
-    , tanThetaLaser(gps.geom_angular_theta_laser.data())
-    , zLaser(gps.geom_angular_z_laser.data())
+    , log2ScalePhi(gps.geom_angular_azimuth_scale_log2_minus11 + 12)
+    , tanThetaLaser(gps.angularTheta.data())
+    , zLaser(gps.angularZ.data())
   {}
 
   Vec3<int32_t> operator()(Vec3<int32_t> sph)
@@ -224,10 +245,10 @@ public:
   CartesianToSpherical(const GeometryParameterSet& gps)
     : sphToCartesian(gps)
     , log2ScaleRadius(gps.geom_angular_radius_inv_scale_log2)
-    , scalePhi(1 << gps.geom_angular_azimuth_scale_log2)
-    , numLasers(gps.geom_angular_theta_laser.size())
-    , tanThetaLaser(gps.geom_angular_theta_laser.data())
-    , zLaser(gps.geom_angular_z_laser.data())
+    , scalePhi(1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12))
+    , numLasers(gps.angularTheta.size())
+    , tanThetaLaser(gps.angularTheta.data())
+    , zLaser(gps.angularZ.data())
   {}
 
   Vec3<int32_t> operator()(Vec3<int32_t> xyz)

@@ -43,6 +43,7 @@
 #include "entropy.h"
 #include "geometry_params.h"
 #include "hls.h"
+#include "quantization.h"
 #include "ringbuf.h"
 #include "tables.h"
 
@@ -57,24 +58,10 @@ const int MAX_NUM_DM_LEAF_POINTS = 2;
 struct PCCOctree3Node {
   // 3D position of the current node's origin (local x,y,z = 0).
   Vec3<int32_t> pos;
-  // 3D position of the current node's origin (local x,y,z = 0) for decoder
-  // reconstruction with in-tree geometry quantization.
-  Vec3<int32_t> posQ;
 
   // Range of point indexes spanned by node
   uint32_t start;
   uint32_t end;
-
-  // address of the current node in 3D morton order.
-  int64_t mortonIdx;
-
-  // pattern denoting occupied neighbour nodes.
-  //    32 8 (y)
-  //     |/
-  //  2--n--1 (x)
-  //    /|
-  //   4 16 (z)
-  uint8_t neighPattern = 0;
 
   // The current node's number of siblings plus one.
   // ie, the number of child nodes present in this node's parent.
@@ -104,17 +91,13 @@ struct OctreeNodePlanar {
 };
 
 //---------------------------------------------------------------------------
+
+int neighPatternFromOccupancy(int pos, int occupancy);
+
+//---------------------------------------------------------------------------
+
 uint8_t mapGeometryOccupancy(uint8_t occupancy, uint8_t neighPattern);
 uint8_t mapGeometryOccupancyInv(uint8_t occupancy, uint8_t neighPattern);
-
-void updateGeometryNeighState(
-  bool siblingRestriction,
-  const ringbuf<PCCOctree3Node>::iterator& bufEnd,
-  int64_t numNodesNextLvl,
-  PCCOctree3Node& child,
-  int childIdx,
-  uint8_t neighPattern,
-  uint8_t parentOccupancy);
 
 //---------------------------------------------------------------------------
 // Determine if a node is a leaf node based on size.
@@ -129,6 +112,11 @@ isLeafNode(const Vec3<int>& sizeLog2)
 }
 
 //---------------------------------------------------------------------------
+// Generates an idcm enable mask
+
+uint32_t mkIdcmEnableMask(const GeometryParameterSet& gps);
+
+//---------------------------------------------------------------------------
 // Determine if direct coding is permitted.
 // If tool is enabled:
 //   - Block must not be near the bottom of the tree
@@ -138,6 +126,7 @@ inline bool
 isDirectModeEligible(
   int intensity,
   int nodeSizeLog2,
+  int nodeNeighPattern,
   const PCCOctree3Node& node,
   const PCCOctree3Node& child)
 {
@@ -145,11 +134,11 @@ isDirectModeEligible(
     return false;
 
   if (intensity == 1)
-    return (nodeSizeLog2 >= 2) && (node.neighPattern == 0)
+    return (nodeSizeLog2 >= 2) && (nodeNeighPattern == 0)
       && (child.numSiblingsPlus1 == 1) && (node.numSiblingsPlus1 <= 2);
 
   if (intensity == 2)
-    return (nodeSizeLog2 >= 2) && (node.neighPattern == 0);
+    return (nodeSizeLog2 >= 2) && (nodeNeighPattern == 0);
 
   // This is basically unconditionally enabled.
   // If a node is that is IDCM-eligible is not coded with IDCM and has only
@@ -167,7 +156,7 @@ isDirectModeEligible(
 inline const uint8_t*
 neighPattern64toR1(const GeometryParameterSet& gps)
 {
-  if (gps.neighbour_avail_boundary_log2 > 0)
+  if (gps.neighbour_avail_boundary_log2_minus1 > 0)
     return kNeighPattern64to9;
   return kNeighPattern64to6;
 }
@@ -268,6 +257,79 @@ nonSplitQtBtAxes(const Vec3<int>& nodeSizeLog2, const Vec3<int>& childSizeLog2)
 }
 
 //============================================================================
+// Scales quantized positions used internally in angular coding.
+//
+// NB: this is not used to scale output positions since generated positions
+//     are not clipped to node boundaries.
+//
+// NB: there are two different position representations used in the codec:
+//        ppppppssssss = original position
+//        ppppppqqqq00 = pos, (quantisation) node size aligned -> use scaleNs()
+//        00ppppppqqqq = pos, effective node size aligned -> use scaleEns()
+//     where p are unquantised bits, q are quantised bits, and 0 are zero bits.
+
+class OctreeAngPosScaler {
+  QuantizerGeom _quant;
+  Vec3<uint32_t> _mask;
+  int _qp;
+
+public:
+  OctreeAngPosScaler(int qp, const Vec3<uint32_t>& quantMaskBits)
+    : _quant(qp), _qp(qp), _mask(quantMaskBits)
+  {}
+
+  // Scale an effectiveNodeSize aligned position as the k-th position component.
+  int scaleEns(int k, int pos) const;
+
+  // Scale an effectiveNodeSize aligned position.
+  Vec3<int> scaleEns(Vec3<int> pos) const;
+
+  // Scale a NodeSize aligned position.
+  Vec3<int> scaleNs(Vec3<int> pos) const;
+};
+
+//----------------------------------------------------------------------------
+
+inline int
+OctreeAngPosScaler::scaleEns(int k, int pos) const
+{
+  if (!_qp)
+    return pos;
+
+  int shiftBits = QuantizerGeom::qpShift(_qp);
+  int lowPart = pos & (_mask[k] >> shiftBits);
+  int highPart = pos ^ lowPart;
+  int lowPartScaled = _quant.scale(lowPart);
+
+  return (highPart << shiftBits) + lowPartScaled;
+}
+
+//----------------------------------------------------------------------------
+
+inline Vec3<int32_t>
+OctreeAngPosScaler::scaleEns(Vec3<int32_t> pos) const
+{
+  if (!_qp)
+    return pos;
+
+  for (int k = 0; k < 3; k++)
+    pos[k] = scaleEns(k, pos[k]);
+
+  return pos;
+}
+//----------------------------------------------------------------------------
+
+inline Vec3<int32_t>
+OctreeAngPosScaler::scaleNs(Vec3<int32_t> pos) const
+{
+  if (!_qp)
+    return pos;
+
+  // convert pos to effectiveNodeSize form
+  return scaleEns(pos >> QuantizerGeom::qpShift(_qp));
+}
+
+//============================================================================
 
 class AzimuthalPhiZi {
 public:
@@ -294,26 +356,23 @@ private:
 
 struct OctreePlanarBuffer {
   static constexpr unsigned numBitsC = 14;
-  static constexpr unsigned numBitsAb = 7;
+  static constexpr unsigned numBitsAb = 5;
   static constexpr unsigned rowSize = 1;
   static_assert(numBitsC >= 0 && numBitsC <= 32, "0 <= numBitsC <= 32");
   static_assert(numBitsAb >= 0 && numBitsAb <= 32, "0 <= numBitsAb <= 32");
   static_assert(rowSize > 0, "rowSize must be greater than 0");
-  static constexpr unsigned shiftAb = 1;
+  static constexpr unsigned shiftAb = 3;
   static constexpr int maskAb = ((1 << numBitsAb) - 1) << shiftAb;
   static constexpr int maskC = (1 << numBitsC) - 1;
 
 #pragma pack(push)
 #pragma pack(1)
   struct Elmt {
-    // (a, b) are (s, t) for planar v,
-    //            (s, v) for planar t, and
-    //            (t, v) for planar s
-    unsigned int a : numBitsAb;
+    // maximum of two position components
+    unsigned int pos : numBitsAb;
 
     // -2: not used, -1: not planar, 0: plane 0, 1: plane 1
     int planeIdx : 2;
-    unsigned int b : numBitsAb;
   };
 #pragma pack(pop)
 
@@ -365,25 +424,18 @@ struct OctreePlanarState {
 };
 
 // determine if a 222 block is planar
-void isPlanarNode(
-  const PCCPointSet3& pointCloud,
-  const PCCOctree3Node& node0,
-  const Vec3<int>& sizeLog2,
-  uint8_t& planarMode,
-  uint8_t& planePosBits,
-  const bool planarEligible[3]);
+void setPlanesFromOccupancy(int occupancy, OctreeNodePlanar& planar);
 
-int maskPlanarX(const OctreeNodePlanar& planar, bool activatable);
-int maskPlanarY(const OctreeNodePlanar& planar, bool activatable);
-int maskPlanarZ(const OctreeNodePlanar& planar, bool activatable);
+int maskPlanarX(const OctreeNodePlanar& planar);
+int maskPlanarY(const OctreeNodePlanar& planar);
+int maskPlanarZ(const OctreeNodePlanar& planar);
 
-void
-maskPlanar(OctreeNodePlanar& planar, int mask[3], const int occupancySkip);
+void maskPlanar(OctreeNodePlanar& planar, int mask[3], int codedAxes);
 
 int determineContextAngleForPlanar(
-  PCCOctree3Node& child,
-  const Vec3<int>& headPos,
-  Vec3<int> childSizeLog2,
+  PCCOctree3Node& node,
+  const Vec3<int>& nodeSizeLog2,
+  const Vec3<int>& angularOrigin,
   const int* zLaser,
   const int* thetaLaser,
   const int numLasers,
@@ -391,8 +443,8 @@ int determineContextAngleForPlanar(
   const AzimuthalPhiZi& phiZi,
   int* phiBuffer,
   int* contextAnglePhiX,
-  int* contextAnglePhiY);
-;
+  int* contextAnglePhiY,
+  Vec3<uint32_t> quantMasks);
 
 //----------------------------------------------------------------------------
 
@@ -406,9 +458,11 @@ public:
 
 protected:
   AdaptiveBitModel _ctxSingleChild;
-  AdaptiveBitModel _ctxSinglePointPerBlock;
-  AdaptiveBitModel _ctxSingleIdcmDupPoint;
-  AdaptiveBitModel _ctxPointCountPerBlock;
+
+  AdaptiveBitModel _ctxDupPointCntGt0;
+  AdaptiveBitModel _ctxDupPointCntGt1;
+  AdaptiveBitModel _ctxDupPointCntEgl;
+
   AdaptiveBitModel _ctxBlockSkipTh;
   AdaptiveBitModel _ctxNumIdcmPointsGt1;
   AdaptiveBitModel _ctxSameZ;
@@ -419,25 +473,17 @@ protected:
   AdaptiveBitModel _ctxSameBitHighz[5];
 
   // residual laser index
-  AdaptiveBitModel _ctxThetaResIsZero;
+  AdaptiveBitModel _ctxThetaRes[3];
   AdaptiveBitModel _ctxThetaResSign;
-  AdaptiveBitModel _ctxThetaResIsOne;
-  AdaptiveBitModel _ctxThetaResIsTwo;
   AdaptiveBitModel _ctxThetaResExp;
 
-  AdaptiveBitModel _ctxPhiResIsZero;
-  AdaptiveBitModel _ctxPhiSign;
-  AdaptiveBitModel _ctxPhiResIsOne;
-  AdaptiveBitModel _ctxPhiResIsTwo;
-  AdaptiveBitModel _ctxPhiResExp;
-
-  AdaptiveBitModel _ctxQpOffsetIsZero;
+  AdaptiveBitModel _ctxQpOffsetAbsGt0;
   AdaptiveBitModel _ctxQpOffsetSign;
   AdaptiveBitModel _ctxQpOffsetAbsEgl;
 
   // for planar mode xyz
   AdaptiveBitModel _ctxPlanarMode[3];
-  AdaptiveBitModel _ctxPlanarPlaneLastIndex[3][4][6];
+  AdaptiveBitModel _ctxPlanarPlaneLastIndex[3][3][4];
   AdaptiveBitModel _ctxPlanarPlaneLastIndexZ[3];
   AdaptiveBitModel _ctxPlanarPlaneLastIndexAngular[4];
   AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularIdcm[4];
@@ -480,7 +526,7 @@ void decodeGeometryOctree(
   int skipLastLayers,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  std::vector<std::unique_ptr<EntropyDecoder>>& arithmeticDecoders,
+  EntropyDecoder& arithmeticDecoder,
   pcc::ringbuf<PCCOctree3Node>* nodesRemaining);
 
 //============================================================================

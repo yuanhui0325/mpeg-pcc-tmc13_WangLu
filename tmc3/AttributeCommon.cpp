@@ -61,8 +61,12 @@ AttributeLods::generate(
     numPointsInLod, indexes);
 
   assert(predictors.size() == cloud.getPointCount());
-  for (auto& predictor : predictors)
+  for (auto& predictor : predictors) {
     predictor.computeWeights();
+    if (aps.attr_encoding == AttributeEncoding::kPredictingTransform)
+      if (aps.pred_weight_blending_enabled_flag)
+        predictor.blendWeights(cloud, indexes);
+  }
 }
 
 //----------------------------------------------------------------------------
@@ -94,7 +98,7 @@ AttributeLods::isReusable(
   if (_aps.intra_lod_search_range != aps.intra_lod_search_range)
     return false;
 
-  if (_aps.num_detail_levels != aps.num_detail_levels)
+  if (_aps.num_detail_levels_minus1 != aps.num_detail_levels_minus1)
     return false;
 
   if (_aps.lodNeighBias != aps.lodNeighBias)
@@ -104,7 +108,7 @@ AttributeLods::isReusable(
   if (_aps.scalable_lifting_enabled_flag || aps.scalable_lifting_enabled_flag)
     return false;
 
-  if (_aps.lod_decimation_enabled_flag != aps.lod_decimation_enabled_flag)
+  if (_aps.lod_decimation_type != aps.lod_decimation_type)
     return false;
 
   if (_aps.dist2 + _abh.attr_dist2_delta != aps.dist2 + abh.attr_dist2_delta)
@@ -114,14 +118,81 @@ AttributeLods::isReusable(
     return false;
 
   if (
-    _aps.intra_lod_prediction_enabled_flag
-    != aps.intra_lod_prediction_enabled_flag)
+    _aps.intra_lod_prediction_skip_layers
+    != aps.intra_lod_prediction_skip_layers)
     return false;
 
   if (_aps.canonical_point_order_flag != aps.canonical_point_order_flag)
     return false;
 
+  if (
+    _aps.pred_weight_blending_enabled_flag
+    != aps.pred_weight_blending_enabled_flag)
+    return false;
+
   return true;
+}
+
+//============================================================================
+
+bool
+predModeEligibleColor(
+  const AttributeDescription& desc,
+  const AttributeParameterSet& aps,
+  const PCCPointSet3& pointCloud,
+  const std::vector<uint32_t>& indexes,
+  const PCCPredictor& predictor)
+{
+  if (predictor.neighborCount <= 1 || !aps.max_num_direct_predictors)
+    return false;
+
+  Vec3<int64_t> minValue = {0, 0, 0};
+  Vec3<int64_t> maxValue = {0, 0, 0};
+  for (int i = 0; i < predictor.neighborCount; ++i) {
+    const Vec3<attr_t> colorNeighbor =
+      pointCloud.getColor(indexes[predictor.neighbors[i].predictorIndex]);
+    for (size_t k = 0; k < 3; ++k) {
+      if (i == 0 || colorNeighbor[k] < minValue[k]) {
+        minValue[k] = colorNeighbor[k];
+      }
+      if (i == 0 || colorNeighbor[k] > maxValue[k]) {
+        maxValue[k] = colorNeighbor[k];
+      }
+    }
+  }
+
+  auto maxDiff = (maxValue - minValue).max();
+  return maxDiff >= aps.adaptivePredictionThreshold(desc);
+}
+
+//----------------------------------------------------------------------------
+
+bool
+predModeEligibleRefl(
+  const AttributeDescription& desc,
+  const AttributeParameterSet& aps,
+  const PCCPointSet3& pointCloud,
+  const std::vector<uint32_t>& indexes,
+  const PCCPredictor& predictor)
+{
+  if (predictor.neighborCount <= 1 || !aps.max_num_direct_predictors)
+    return false;
+
+  int64_t minValue = 0;
+  int64_t maxValue = 0;
+  for (int i = 0; i < predictor.neighborCount; ++i) {
+    const attr_t reflectanceNeighbor = pointCloud.getReflectance(
+      indexes[predictor.neighbors[i].predictorIndex]);
+    if (i == 0 || reflectanceNeighbor < minValue) {
+      minValue = reflectanceNeighbor;
+    }
+    if (i == 0 || reflectanceNeighbor > maxValue) {
+      maxValue = reflectanceNeighbor;
+    }
+  }
+
+  auto maxDiff = maxValue - minValue;
+  return maxDiff >= aps.adaptivePredictionThreshold(desc);
 }
 
 //============================================================================

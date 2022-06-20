@@ -56,7 +56,7 @@ namespace pcc {
 
 class MortonMap3D {
 public:
-  void resize(const uint32_t cubeSizeLog2)
+  void resize(bool childOccupancyEnabled, const uint32_t cubeSizeLog2)
   {
     assert(cubeSizeLog2 < 10);
     const uint32_t halfCubeSizeLog2 = cubeSizeLog2 ? cubeSizeLog2 - 1 : 0;
@@ -64,28 +64,20 @@ public:
     _cubeSize = 1 << cubeSizeLog2;
     _bufferSizeInBytes = 1 << (3 * cubeSizeLog2);
     _buffer.reset(new uint8_t[_bufferSizeInBytes]);
-    _childOccupancy.reset(new uint8_t[_bufferSizeInBytes << 3]);
+    if (childOccupancyEnabled)
+      _childOccupancy.reset(new uint8_t[_bufferSizeInBytes << 3]);
     _updates.reserve(1 << 16);
   }
 
   int cubeSize() const { return _cubeSize; }
   int cubeSizeLog2() const { return _cubeSizeLog2; }
 
-  void clear(bool clearOccupancy)
-  {
-    memset(_buffer.get(), 0, _bufferSizeInBytes);
-    if (clearOccupancy)
-      memset(_childOccupancy.get(), 0, _bufferSizeInBytes << 3);
-    _updates.resize(0);
-  }
+  // Removes all updates, zeros all map entries.  Does not affect child map.
+  void clear();
 
-  void clearUpdates()
-  {
-    for (const auto byteIndex : _updates) {
-      _buffer[byteIndex] = uint8_t(0);
-    }
-    _updates.resize(0);
-  }
+  // Reverts all updates, zeroing affected map entries.
+  // Only modified bytes are touched.
+  void clearUpdates();
 
   void setByte(
     const int32_t x, const int32_t y, const int32_t z, const uint8_t value)
@@ -137,7 +129,8 @@ public:
     assert(
       x >= 0 && y >= 0 && z >= 0 && x < _cubeSize && y < _cubeSize
       && z < _cubeSize);
-    return _buffer[getByteIndex(x, y, z)] & 1;
+
+    return get(x, y, z, 1, 1, 1);
   }
 
   uint32_t
@@ -148,7 +141,7 @@ public:
       || z >= _cubeSize) {
       return false;
     }
-    return get(x, y, z);
+    return getWithCheck(x, y, z, 1, 1, 1);
   }
 
   void setChildOcc(int32_t x, int32_t y, int32_t z, uint8_t childOccupancy)
@@ -191,6 +184,11 @@ private:
 
 struct GeometryNeighPattern {
   // Mask indicating presence of neigbours of the corresponding tree node
+  //    32 8 (y)
+  //     |/
+  //  2--n--1 (x)
+  //    /|
+  //   4 16 (z)
   uint8_t neighPattern;
 
   // mask indicating the number of external child neighbours
@@ -199,6 +197,9 @@ struct GeometryNeighPattern {
 
   // mask indicating unoccupied external child neighbours
   uint8_t adjacencyUnocc;
+
+  // occupancy map of {x-1, y-1, z-1} neighbours.
+  uint8_t adjNeighOcc[3];
 };
 
 //============================================================================
@@ -209,7 +210,8 @@ struct GeometryNeighPattern {
 GeometryNeighPattern makeGeometryNeighPattern(
   bool adjacent_child_contextualization_enabled_flag,
   const Vec3<int32_t>& currentPosition,
-  const int atlasShift,
+  int codedAxesPrevLvl,
+  int codedAxesCurLvl,
   const MortonMap3D& occupancyAtlas);
 
 // populate (if necessary) the occupancy atlas with occupancy information

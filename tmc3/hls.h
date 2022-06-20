@@ -36,7 +36,6 @@
 #pragma once
 
 #include "PCCMath.h"
-
 #include <cstdint>
 #include <ostream>
 #include <vector>
@@ -55,6 +54,8 @@ enum class PayloadType
   kTileInventory = 5,
   kFrameBoundaryMarker = 6,
   kConstantAttribute = 7,
+  kGeneralizedAttrParamInventory = 8,
+  kUserData = 9,
 };
 
 //============================================================================
@@ -63,10 +64,11 @@ enum class KnownAttributeLabel : uint32_t
 {
   kColour = 0,
   kReflectance = 1,
-  kFrameIndex = 2,
-  kMaterialId = 3,
-  kTransparency = 4,
-  kNormal = 5,
+  kOpacity = 2,
+  kFrameIndex = 3,
+  kFrameNumber = 4,
+  kMaterialId = 5,
+  kNormal = 6,
 
   // Indicates that the attrabute label is described by an Oid
   kOid = 0xffffffff,
@@ -127,9 +129,19 @@ std::ostream& operator<<(std::ostream& os, const AttributeLabel& label);
 
 enum class AttributeEncoding
 {
-  kPredictingTransform = 0,
-  kRAHTransform = 1,
+  kRAHTransform = 0,
+  kPredictingTransform = 1,
   kLiftingTransform = 2,
+  kRaw = 3,
+};
+
+//============================================================================
+
+enum class LodDecimationMethod
+{
+  kNone = 0,
+  kPeriodic = 1,
+  kCentroid = 2,
 };
 
 //============================================================================
@@ -230,22 +242,7 @@ struct OpaqueAttributeParameter {
 
 //============================================================================
 
-// invariant properties
-struct AttributeDescription {
-  int attr_num_dimensions_minus1;
-
-  // NB: the instance id is not the attribute id / attrId used in the decoding
-  // process.  The instance id is used to distinguish between, in the decoded
-  // output, multiple attributes with the same label.  Eg, rgb0 and rgb1.
-  int attr_instance_id;
-
-  int bitdepth;
-  int bitdepthSecondary;
-
-  AttributeLabel attributeLabel;
-
-  // Known attribute parameters
-
+struct AttributeParameters {
   // indicates if the cicp attribute parameter is valid
   bool cicpParametersPresent;
   int cicp_colour_primaries_idx;
@@ -255,8 +252,9 @@ struct AttributeDescription {
 
   // attribute scaling
   bool scalingParametersPresent;
-  int source_attr_scale_log2;
-  int source_attr_offset_log2;
+  int attr_scale_minus1;
+  int attr_frac_bits;
+  int attr_offset;
 
   // soft default attribute values.
   // If empty, use hard default values.
@@ -264,6 +262,56 @@ struct AttributeDescription {
 
   // Unknown attribute parameters
   std::vector<OpaqueAttributeParameter> opaqueParameters;
+
+  int numParams() const
+  {
+    int count = opaqueParameters.size() + cicpParametersPresent
+      + scalingParametersPresent + !attr_default_value.empty();
+    return count;
+  }
+
+  void clear()
+  {
+    cicpParametersPresent = false;
+    scalingParametersPresent = false;
+    attr_default_value.clear();
+    opaqueParameters.clear();
+  }
+};
+
+//============================================================================
+
+struct AttributeDescription {
+  int attr_num_dimensions_minus1;
+
+  // NB: the instance id is not the attribute id / attrId used in the decoding
+  // process.  The instance id is used to distinguish between, in the decoded
+  // output, multiple attributes with the same label.  Eg, rgb0 and rgb1.
+  int attr_instance_id;
+
+  int bitdepth;
+
+  AttributeLabel attributeLabel;
+
+  AttributeParameters params;
+};
+
+//============================================================================
+
+struct AttributeParamInventoryHdr {
+  int attr_param_seq_parameter_set_id;
+
+  // LSBs of FrameCtr used to identify the frame the parameters apply to
+  int attr_param_frame_ctr_lsb;
+
+  // The attribute index in the SPS.
+  int attr_param_sps_attr_idx;
+};
+
+//---------------------------------------------------------------------------
+
+struct AttributeParamInventory : public AttributeParamInventoryHdr {
+  AttributeParameters params;
 };
 
 //============================================================================
@@ -280,6 +328,13 @@ struct ProfileCompatibility {
 
   // indicates that there are no duplicate points in the reconstructed frames
   bool unique_point_positions_constraint_flag;
+
+  // during development, no profile bits are set
+  bool isDraftProfile() const
+  {
+    return main_profile_compatibility_flag == 0
+      && reserved_profile_compatibility_21bits == 0;
+  }
 };
 
 //============================================================================
@@ -287,7 +342,7 @@ struct ProfileCompatibility {
 enum class ScaleUnit : bool
 {
   kDimensionless = 0,
-  kPointsPerMetre = 1,
+  kMetre = 1,
 };
 
 //============================================================================
@@ -299,28 +354,62 @@ struct SequenceParameterSet {
   int level;
 
   // Number of bits used to code seqBoundingBoxOrigin
-  int sps_bounding_box_offset_bits_minus1;
+  int sps_bounding_box_offset_bits;
 
   // the bounding box origin (in stv axis order).
   Vec3<int> seqBoundingBoxOrigin;
 
   // Number of bits used to code seqBoundingBoxSize
-  int sps_bounding_box_size_bits_minus1;
+  int sps_bounding_box_size_bits;
 
   // the size of the bounding box (in stv axis order).
   Vec3<int> seqBoundingBoxSize;
 
   // A value describing the scaling of the source positions prior to encoding.
-  float seq_geom_scale;
+  Rational seqGeomScale;
 
-  // Indicates that units used to interpret seq_geom_scale.
+  // Indicates that units used to interpret seqGeomScale.
   ScaleUnit seq_geom_scale_unit_flag;
+
+  // Represents a coded factorisation of a rational:
+  //  (2^denominatorLog2 + numeratorModDenominator) * 2^numeratorMulLog2
+  //  ------------------------------------------------------------------
+  //                       2^denominatorLog2
+  struct GlobalScale {
+    int numeratorMulLog2 = 0;
+    int numeratorModDenominator = 0;
+    int denominatorLog2 = 0;
+
+    // Initialized to 1/1
+    GlobalScale() = default;
+
+    // Convert rational to global scale representation.
+    // NB: may throw an exception if not possible
+    GlobalScale(Rational x);
+
+    // Convert to simplified Rational form
+    operator Rational() const;
+  };
+
+  // Scale factor applied to the coded geometry to get the output geometry
+  GlobalScale globalScale;
+
+  int& global_scale_mul_log2() { return globalScale.numeratorMulLog2; }
+  int& global_scale_rem() { return globalScale.numeratorModDenominator; }
+  int& global_scale_fp_bits() { return globalScale.denominatorLog2; }
+
+  int global_scale_mul_log2() const { return globalScale.numeratorMulLog2; }
+  int global_scale_rem() const { return globalScale.numeratorModDenominator; }
+  int global_scale_fp_bits() const { return globalScale.denominatorLog2; }
 
   // NB: attributeSets.size() = num_attribute_sets
   std::vector<AttributeDescription> attributeSets;
 
-  // The number of bits to use for frame_idx
-  int log2_max_frame_idx;
+  // The number of bits to use for frame_ctr
+  int frame_ctr_bits;
+
+  // The number of bits to use for slice_tag
+  int slice_tag_bits;
 
   // Defines the ordering of the position components (eg, xyz vs zyx)
   AxisOrder geometry_axis_order;
@@ -356,7 +445,7 @@ struct GeometryParameterSet {
   // Defines the size of the neighbour availiability volume (aka
   // look-ahead cube size) for occupancy searches.  A value of 0
   // indicates that only neighbours that are direct siblings are available.
-  int neighbour_avail_boundary_log2;
+  int neighbour_avail_boundary_log2_minus1;
 
   // Controls the use of early termination of the geometry tree
   // by directly coding the position of isolated points.
@@ -403,29 +492,29 @@ struct GeometryParameterSet {
   int geom_planar_threshold0;
   int geom_planar_threshold1;
   int geom_planar_threshold2;
-  int geom_planar_idcm_threshold;
+  int geom_idcm_rate_minus1;
 
-  // Controls the use of xyz-planar mode
+  // Enables angular coding in octree/predgeom
   bool geom_angular_mode_enabled_flag;
 
-  // Sequence bounding box relative origin for angular mode computations
+  // Indicates whether the angualed origin is signalled in the gps or slice
+  bool geom_slice_angular_origin_present_flag;
+
+  // Origin for angular mode computations relative to sequence bounding box
   // (in stv axis order).
-  Vec3<int> geomAngularOrigin;
+  Vec3<int> gpsAngularOrigin;
 
-  int geom_angular_num_lidar_lasers() const
-  {
-    return geom_angular_theta_laser.size();
-  }
+  int numLasers() const { return angularTheta.size(); }
 
-  std::vector<int> geom_angular_theta_laser;
-  std::vector<int> geom_angular_z_laser;
-  std::vector<int> geom_angular_num_phi_per_turn;
+  std::vector<int> angularTheta;
+  std::vector<int> angularZ;
+  std::vector<int> angularNumPhiPerTurn;
 
   int geomAngularThetaPred(int i) const
   {
     if (!--i)
-      return geom_angular_theta_laser[i];
-    return 2 * geom_angular_theta_laser[i] - geom_angular_theta_laser[i - 1];
+      return angularTheta[i];
+    return 2 * angularTheta[i] - angularTheta[i - 1];
   }
 
   // disable the use of planar buffer when angular mode is enabled
@@ -435,8 +524,8 @@ struct GeometryParameterSet {
   int geom_qp_offset_intvl_log2;
 
   // scale factor for azimuth in coding predictive geometry coding
-  int geom_angular_azimuth_scale_log2;
-  int geom_angular_azimuth_speed;
+  int geom_angular_azimuth_scale_log2_minus11;
+  int geom_angular_azimuth_speed_minus1;
 
   // inverse scale factor for radius coding in predictive geometry coding
   int geom_angular_radius_inv_scale_log2;
@@ -444,6 +533,9 @@ struct GeometryParameterSet {
   // Indicates that the geometry footer contains a count of point
   // in each octree level.
   bool octree_point_count_list_present_flag;
+
+  // Quantize azimuth residuals in algular predictive geometry coder.
+  bool azimuth_scaling_enabled_flag;
 };
 
 //============================================================================
@@ -460,9 +552,11 @@ struct GeometryBrickFooter {
 
 struct GeometryBrickHeader {
   int geom_geom_parameter_set_id;
-  int geom_tile_id;
+  int slice_tag;
   int geom_slice_id;
-  int frame_idx;
+
+  // The LSBs of the system frame counter
+  int frame_ctr_lsb;
 
   // Origin of the reconstructed geometry, relative to sequence bounding box
   // (in stv axis order).
@@ -471,6 +565,18 @@ struct GeometryBrickHeader {
 
   // Number of bits to represent geomBoxOrigin >> geom_box_log2_scale
   int geom_box_origin_bits_minus1;
+
+  // Per-slice version of gpsAngularOrigin, but relative to slice bounding box
+  // (in stv axis order).
+  Vec3<int> gbhAngularOrigin;
+
+  // Origin for angular mode computations relative to slice bounding box
+  Vec3<int> geomAngularOrigin(const GeometryParameterSet& gps) const
+  {
+    if (gps.geom_slice_angular_origin_present_flag)
+      return gbhAngularOrigin;
+    return gps.gpsAngularOrigin - geomBoxOrigin;
+  }
 
   // the size of the root geometry node
   // NB: this is only needed for the initial node size determination at
@@ -495,20 +601,11 @@ struct GeometryBrickHeader {
       << gps.geom_qp_multiplier_log2;
   }
 
-  // octree depth at which qp offsets whould be signalled
-  int geom_octree_qp_offset_depth;
-
   // block size offset for predictive geometry coding (if enabled)
   int geom_qp_offset_intvl_log2_delta;
 
   // number of entropy streams used to encode the octree
   int geom_stream_cnt_minus1;
-
-  // length of each entropy stream
-  std::vector<size_t> geom_stream_len;
-
-  // number of bits to signal entropy stream lengths
-  int geom_stream_len_bits;
 
   int geomBoxLog2Scale(const GeometryParameterSet& gps) const
   {
@@ -518,7 +615,12 @@ struct GeometryBrickHeader {
   }
 
   // size of triangle nodes (reconstructed surface) in trisoup geometry.
-  int trisoup_node_size_log2;
+  int trisoup_node_size_log2_minus2;
+
+  int trisoupNodeSizeLog2(const GeometryParameterSet& gps) const
+  {
+    return gps.trisoup_enabled_flag ? trisoup_node_size_log2_minus2 + 2 : 0;
+  }
 
   // downsampling rate used in tringle voxelisation
   int trisoup_sampling_value_minus1;
@@ -536,6 +638,9 @@ struct GeometryBrickHeader {
 
   // The id of the previous slice in bitsream order
   int prev_slice_id;
+
+  // minimum radius for predictive geometry coding with angular mode
+  int pgeom_min_radius;
 };
 
 //============================================================================
@@ -554,23 +659,51 @@ struct AttributeParameterSet {
 
   //--- lifting/predicting transform parameters
 
-  bool lod_decimation_enabled_flag;
+  LodDecimationMethod lod_decimation_type;
   bool canonical_point_order_flag;
   int num_pred_nearest_neighbours_minus1;
   int max_num_direct_predictors;
+  bool direct_avg_predictor_disabled_flag;
   int adaptive_prediction_threshold;
   int intra_lod_search_range;
   int inter_lod_search_range;
 
+  // Neighbour contribution weights used to calculate quantization weights
+  Vec3<uint32_t> quant_neigh_weight;
+
+  int adaptivePredictionThreshold(const AttributeDescription& desc) const
+  {
+    return adaptive_prediction_threshold << std::max(0, desc.bitdepth - 8);
+  }
+
   // NB: in stv order
   Vec3<int32_t> lodNeighBias;
 
-  bool intra_lod_prediction_enabled_flag;
+  // The number of detail levels, starting from the finest, to skip intra
+  // prediction.
+  int intra_lod_prediction_skip_layers;
+
+  // A large value for intra_lod_prediction_skip_layers that causes all layers
+  // to be skipped.
+  static const int kSkipAllLayers = 0x7fffffff;
+
   bool inter_component_prediction_enabled_flag;
   bool last_component_prediction_enabled_flag;
 
-  // NB: derived from num_detail_levels_minus1
-  int num_detail_levels;
+  // Whether prediction weights are blended according to spatial positions
+  bool pred_weight_blending_enabled_flag;
+
+  // The number of refinement layers
+  int num_detail_levels_minus1;
+
+  // The configured number of detail levels (there is always at least one).
+  // NB: the actual number of detail levels generated may be lower.
+  int maxNumDetailLevels() const
+  {
+    return scalable_lifting_enabled_flag ? 21 /* MaxRootNodeDimLog2 */
+                                         : num_detail_levels_minus1 + 1;
+  }
+
   std::vector<int> lodSamplingPeriod;
 
   int dist2;
@@ -588,11 +721,20 @@ struct AttributeParameterSet {
 
   //--- lifting parameters
   bool scalable_lifting_enabled_flag;
-  int max_neigh_range;
+  int max_neigh_range_minus1;
 
   // indicates that attribute coding should be performed in
   // pseudo-spherical domain
   bool spherical_coord_flag;
+
+  // (r, phi, laserid) scale factors for domain conversion
+  Vec3<int> attr_coord_scale;
+
+  // Whether raw attribute are coded as fixed width or variable length.
+  bool raw_attr_variable_len_flag;
+
+  ///<Attribute RDOQ lambda parameters
+  int lambda;
 };
 
 //============================================================================
@@ -601,6 +743,39 @@ struct AttributeBrickHeader {
   int attr_sps_attr_idx;
   int attr_attr_parameter_set_id;
   int attr_geom_slice_id;
+
+  // Last component prediction coefficients.  Only present for lifting
+  // transform with three components.
+  std::vector<int8_t> attrLcpCoeffs;
+
+  // indicates whether last component prediction coefficients are present.
+  bool lcpPresent(
+    const AttributeDescription& desc, const AttributeParameterSet& aps) const
+  {
+    if (aps.attr_encoding != AttributeEncoding::kLiftingTransform)
+      return false;
+    if (!aps.last_component_prediction_enabled_flag)
+      return false;
+    if (desc.attr_num_dimensions_minus1 != 2)
+      return false;
+    return true;
+  }
+
+  // Inter-component prediction coefficients.
+  std::vector<Vec3<int8_t>> icpCoeffs;
+
+  // indicates whether inter component prediction coefficients are present.
+  bool icpPresent(
+    const AttributeDescription& desc, const AttributeParameterSet& aps) const
+  {
+    if (aps.attr_encoding != AttributeEncoding::kPredictingTransform)
+      return false;
+    if (!aps.inter_component_prediction_enabled_flag)
+      return false;
+    if (desc.attr_num_dimensions_minus1 == 0)
+      return false;
+    return true;
+  }
 
   int attr_qp_delta_luma;
   int attr_qp_delta_chroma;
@@ -634,9 +809,6 @@ struct AttributeBrickHeader {
   int attr_region_bits_minus1;
 
   int32_t attr_dist2_delta;
-
-  // (r, phi, laserid) scale factors for domain conversion
-  Vec3<int> attr_coord_conv_scale;
 };
 
 //============================================================================
@@ -647,6 +819,13 @@ struct ConstantAttributeDataUnit {
   int constattr_geom_slice_id;
 
   std::vector<int> constattr_default_value;
+};
+
+//============================================================================
+
+struct FrameBoundaryMarker {
+  // Identifies the frame to be terminated
+  int fbdu_frame_ctr_lsb;
 };
 
 //============================================================================
@@ -666,8 +845,14 @@ struct TileInventory {
   // id of an applicable sequence parameter set
   int ti_seq_parameter_set_id;
 
+  // Number of bits for frame idx
+  int ti_frame_ctr_bits;
+
+  // Frame idx when tile inventory comes into force
+  int ti_frame_ctr;
+
   // Number of bits, if any, used to signal tile_id
-  bool tile_id_bits;
+  int tile_id_bits;
 
   // the origin of the tiles (in stv axis order).  Likely the sps origin
   Vec3<int> origin;
@@ -682,6 +867,13 @@ struct TileInventory {
 
   // Number of bits to represent each tile's size
   int tile_size_bits_minus1;
+};
+
+//============================================================================
+
+struct UserData {
+  // Identifies the type of user data
+  Oid user_data_oid;
 };
 
 //============================================================================

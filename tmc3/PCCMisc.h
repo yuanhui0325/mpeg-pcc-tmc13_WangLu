@@ -186,6 +186,34 @@ numBits(int x)
 }
 
 //---------------------------------------------------------------------------
+// rotate left by n bits.
+// If n is negative, the effect is to rotate right.
+// NB: Signed types are treated as unsigned.
+
+template<typename T>
+T
+rotateLeft(T val, int n)
+{
+  n &= sizeof(T) * 8 - 1;
+  using unsigned_t = typename std::make_unsigned<T>::type;
+  return (unsigned_t(val) << n) | (unsigned_t(val) >> (8 * sizeof(val) - n));
+}
+
+//---------------------------------------------------------------------------
+// rotate right by n bits.
+// If n is negative, the effect is to rotate left.
+// NB: Signed types are treated as unsigned.
+
+template<typename T>
+T
+rotateRight(T val, int n)
+{
+  n &= sizeof(T) * 8 - 1;
+  using unsigned_t = typename std::make_unsigned<T>::type;
+  return (unsigned_t(val) >> n) | (unsigned_t(val) << (8 * sizeof(val) - n));
+}
+
+//---------------------------------------------------------------------------
 // Compute an approximation of \left\floor \sqrt{x} \right\floor
 
 uint32_t isqrt(uint64_t x) __attribute__((const));
@@ -310,6 +338,35 @@ void
 radixSort8(int maxValLog2, It begin, It end, ValueOp op)
 {
   radixSort8WithAccum(maxValLog2, begin, end, op, NoOp());
+}
+
+//============================================================================
+// A wrapper to reverse the iteration order of a range based for loop
+
+template<typename T>
+struct fwd_is_reverse_iterator {
+  T& obj;
+};
+
+template<typename T>
+auto
+begin(fwd_is_reverse_iterator<T> w) -> decltype(w.obj.rbegin())
+{
+  return w.obj.rbegin();
+}
+
+template<typename T>
+auto
+end(fwd_is_reverse_iterator<T> w) -> decltype(w.obj.rend())
+{
+  return w.obj.rend();
+}
+
+template<typename T>
+fwd_is_reverse_iterator<T>
+inReverse(T&& obj)
+{
+  return {obj};
 }
 
 //----------------------------------------------------------------------------

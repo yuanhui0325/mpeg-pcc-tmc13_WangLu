@@ -42,6 +42,7 @@
 #include "AttributeCommon.h"
 #include "PayloadBuffer.h"
 #include "PCCTMC3Common.h"
+#include "hls.h"
 #include "quantization.h"
 
 namespace pcc {
@@ -118,9 +119,17 @@ protected:
     const AttributeParameterSet& aps,
     const Vec3<attr_t> color,
     const Vec3<attr_t> predictedColor,
+    const Vec3<int8_t> icpCoeff,
     const Quantizers& quant);
 
-  static void computeColorPredictionWeights(
+  static int computeColorDistortions(
+    const AttributeDescription& desc,
+    const Vec3<attr_t> color,
+    const Vec3<attr_t> predictedColor,
+    const Quantizers& quant);
+
+  static void decidePredModeColor(
+    const AttributeDescription& desc,
     const AttributeParameterSet& aps,
     const PCCPointSet3& pointCloud,
     const std::vector<uint32_t>& indexesLOD,
@@ -128,14 +137,19 @@ protected:
     PCCPredictor& predictor,
     PCCResidualsEncoder& encoder,
     PCCResidualsEntropyEstimator& context,
+    const Vec3<int8_t>& icpCoeff,
     const Quantizers& quant);
+
+  static void encodePredModeColor(
+    const AttributeParameterSet& aps, int predMode, Vec3<int32_t>& coeff);
 
   static int64_t computeReflectanceResidual(
     const uint64_t reflectance,
     const uint64_t predictedReflectance,
     const Quantizer& quant);
 
-  static void computeReflectancePredictionWeights(
+  static void decidePredModeRefl(
+    const AttributeDescription& desc,
     const AttributeParameterSet& aps,
     const PCCPointSet3& pointCloud,
     const std::vector<uint32_t>& indexesLOD,
@@ -145,11 +159,21 @@ protected:
     PCCResidualsEntropyEstimator& context,
     const Quantizer& quant);
 
-private:
-  std::vector<int8_t> computeLastComponentPredictionCoeff(
-    const std::vector<Vec3<int64_t>>& coeffs);
+  static void encodePredModeRefl(
+    const AttributeParameterSet& aps, int predMode, int32_t& coeff);
 
 private:
+  std::vector<int8_t> computeLastComponentPredictionCoeff(
+    const AttributeParameterSet& aps,
+    const std::vector<Vec3<int64_t>>& coeffs);
+
+  std::vector<Vec3<int8_t>> computeInterComponentPredictionCoeffs(
+    const AttributeParameterSet& aps, const PCCPointSet3& pointCloud);
+
+private:
+  // The current attribute slice header
+  AttributeBrickHeader* _abh;
+
   AttributeLods _lods;
 };
 

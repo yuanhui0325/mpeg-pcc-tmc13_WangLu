@@ -76,6 +76,7 @@ protected:
   void decodeReflectancesLift(
     const AttributeDescription& desc,
     const AttributeParameterSet& aps,
+    const AttributeBrickHeader& abh,
     const QpSet& qpSet,
     int geom_num_points_minus1,
     int minGeomNodeSizeLog2,
@@ -85,6 +86,7 @@ protected:
   void decodeColorsLift(
     const AttributeDescription& desc,
     const AttributeParameterSet& aps,
+    const AttributeBrickHeader& abh,
     const QpSet& qpSet,
     int geom_num_points_minus1,
     int minGeomNodeSizeLog2,
@@ -94,6 +96,7 @@ protected:
   void decodeReflectancesPred(
     const AttributeDescription& desc,
     const AttributeParameterSet& aps,
+    const AttributeBrickHeader& abh,
     const QpSet& qpSet,
     PCCResidualsDecoder& decoder,
     PCCPointSet3& pointCloud);
@@ -101,6 +104,7 @@ protected:
   void decodeColorsPred(
     const AttributeDescription& desc,
     const AttributeParameterSet& aps,
+    const AttributeBrickHeader& abh,
     const QpSet& qpSet,
     PCCResidualsDecoder& decoder,
     PCCPointSet3& pointCloud);
@@ -119,19 +123,13 @@ protected:
     PCCResidualsDecoder& decoder,
     PCCPointSet3& pointCloud);
 
-  static void computeColorPredictionWeights(
+  static void decodePredModeColor(
     const AttributeParameterSet& aps,
-    const PCCPointSet3& pointCloud,
-    const std::vector<uint32_t>& indexes,
-    PCCPredictor& predictor,
-    PCCResidualsDecoder& decoder);
+    Vec3<int32_t>& coeff,
+    PCCPredictor& predictor);
 
-  static void computeReflectancePredictionWeights(
-    const AttributeParameterSet& aps,
-    const PCCPointSet3& pointCloud,
-    const std::vector<uint32_t>& indexes,
-    PCCPredictor& predictor,
-    PCCResidualsDecoder& decoder);
+  static void decodePredModeRefl(
+    const AttributeParameterSet& aps, int32_t& coeff, PCCPredictor& predictor);
 
 private:
   AttributeLods _lods;

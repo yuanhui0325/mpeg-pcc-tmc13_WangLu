@@ -60,7 +60,7 @@ encodeGeometryTrisoup(
   // resume encoding with the last encoder
   auto arithmeticEncoder = arithmeticEncoders.back().get();
 
-  int blockWidth = 1 << gbh.trisoup_node_size_log2;
+  int blockWidth = 1 << gbh.trisoupNodeSizeLog2(gps);
 
   // Determine segind and vertices.
   std::vector<bool> segind;
@@ -77,7 +77,7 @@ encodeGeometryTrisoup(
     decodeTrisoupCommon(
       nodes, segind, vertices, pointCloud, blockWidth, maxval, subsample);
   } else {
-    int maxSubsample = 1 << gbh.trisoup_node_size_log2;
+    int maxSubsample = 1 << gbh.trisoupNodeSizeLog2(gps);
     for (subsample = 1; subsample <= maxSubsample; subsample++) {
       decodeTrisoupCommon(
         nodes, segind, vertices, pointCloud, blockWidth, maxval, subsample);
@@ -101,11 +101,11 @@ encodeGeometryTrisoup(
   }
 
   // Encode vertices to bitstream.
-  AdaptiveMAryModel multiSymbolVerticesModel0(blockWidth);
   assert(numVertices == vertices.size());
   for (int i = 0; i < numVertices; i++) {
-    uint8_t c = vertices[i];
-    arithmeticEncoder->encode(uint32_t(c), multiSymbolVerticesModel0);
+    auto vertex = vertices[i];
+    for (int b = gbh.trisoupNodeSizeLog2(gps) - 1; b >= 0; b--)
+      arithmeticEncoder->encode((vertex >> b) & 1);
   }
 }
 

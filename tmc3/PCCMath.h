@@ -164,11 +164,27 @@ public:
     return *this;
   }
 
+  Vec3& operator<<=(Vec3<int> val)
+  {
+    data[0] <<= val[0];
+    data[1] <<= val[1];
+    data[2] <<= val[2];
+    return *this;
+  }
+
   Vec3& operator>>=(int val)
   {
     data[0] >>= val;
     data[1] >>= val;
     data[2] >>= val;
+    return *this;
+  }
+
+  Vec3& operator>>=(Vec3<int> val)
+  {
+    data[0] >>= val[0];
+    data[1] >>= val[1];
+    data[2] >>= val[2];
     return *this;
   }
 
@@ -311,9 +327,19 @@ public:
     return Vec3<T>(lhs[0] << val, lhs[1] << val, lhs[2] << val);
   }
 
+  friend Vec3 operator<<(const Vec3& lhs, const Vec3<int>& val)
+  {
+    return Vec3<T>(lhs[0] << val[0], lhs[1] << val[1], lhs[2] << val[2]);
+  }
+
   friend Vec3 operator>>(const Vec3& lhs, int val)
   {
     return Vec3<T>(lhs[0] >> val, lhs[1] >> val, lhs[2] >> val);
+  }
+
+  friend Vec3 operator>>(const Vec3& lhs, const Vec3<int>& val)
+  {
+    return Vec3<T>(lhs[0] >> val[0], lhs[1] >> val[1], lhs[2] >> val[2]);
   }
 
   bool operator<(const Vec3& rhs) const
@@ -405,6 +431,21 @@ struct Box3 {
 
   Box3(const Vec3<T>& min, const Vec3<T>& max) : min(min), max(max) {}
 
+  template<typename ForwardIt>
+  Box3(ForwardIt begin, ForwardIt end)
+    : Box3(std::numeric_limits<T>::max(), std::numeric_limits<T>::lowest())
+  {
+    for (auto it = begin; it != end; ++it) {
+      auto& pt = *it;
+      for (int k = 0; k < 3; ++k) {
+        if (pt[k] > max[k])
+          max[k] = pt[k];
+        if (pt[k] < min[k])
+          min[k] = pt[k];
+      }
+    }
+  }
+
   bool contains(const Vec3<T> point) const
   {
     return !(
@@ -493,7 +534,37 @@ typedef DEPRECATED_MSVC Vec3<uint8_t> PCCColor3B DEPRECATED;
 template<typename T>
 using PCCVector3 DEPRECATED = Vec3<T>;
 
+//===========================================================================
+
+struct Rational {
+  int numerator;
+  int denominator;
+
+  Rational() : Rational(0, 1){};
+
+  Rational(int numerator) : Rational(numerator, 1){};
+
+  Rational(int numerator, int denominator)
+    : numerator(numerator), denominator(denominator)
+  {}
+
+  Rational(float val);
+  Rational(double val);
+
+  operator double() const { return double(numerator) / double(denominator); }
+
+  operator float() const { return float(numerator) / float(denominator); }
+};
+
 //---------------------------------------------------------------------------
+
+inline Rational
+reciprocal(const Rational x)
+{
+  return Rational(x.denominator, x.numerator);
+}
+
+//===========================================================================
 
 template<typename T>
 T
@@ -540,6 +611,16 @@ inline int64_t
 PCCClip(const int64_t& n, const int64_t& lower, const int64_t& upper)
 {
   return std::max(lower, std::min(n, upper));
+}
+
+//---------------------------------------------------------------------------
+// Integer division of @x by 2^shift, truncating towards zero.
+
+template<typename T>
+inline T
+divExp2(T x, int shift)
+{
+  return x >= 0 ? x >> shift : -(-x >> shift);
 }
 
 //---------------------------------------------------------------------------
@@ -629,6 +710,34 @@ divApprox(const int64_t a, const uint64_t b, const int32_t log2Scale)
 
 //---------------------------------------------------------------------------
 
+template<unsigned NIter = 1>
+inline int64_t
+recipApprox(int64_t b, int32_t& log2Scale)
+{
+  int log2ScaleOffset = 0;
+  int32_t log2bPlusOne = ilog2(uint64_t(b)) + 1;
+
+  if (log2bPlusOne > 31) {
+    b >>= log2bPlusOne - 31;
+    log2ScaleOffset -= log2bPlusOne - 31;
+  }
+
+  if (log2bPlusOne < 31) {
+    b <<= 31 - log2bPlusOne;
+    log2ScaleOffset += 31 - log2bPlusOne;
+  }
+
+  // Initial approximation: 48/17 - 32/17 * b with 28 bits decimal prec
+  int64_t bRecip = ((0x2d2d2d2dLL << 31) - 0x1e1e1e1eLL * b) >> 28;
+  for (unsigned i = 0; i < NIter; ++i)
+    bRecip += bRecip * ((1LL << 31) - (b * bRecip >> 31)) >> 31;
+
+  log2Scale = (31 << 1) - log2ScaleOffset;
+  return bRecip;
+}
+
+//---------------------------------------------------------------------------
+
 inline Vec3<int64_t>
 divApprox(const Vec3<int64_t> a, const uint64_t b, const int32_t log2Scale)
 {
@@ -676,11 +785,9 @@ isin0(const int32_t x, const int32_t log2Scale)
   const auto b = (1 << ds);
   const auto i0 = (x >> ds);
   const auto x0 = i0 << ds;
-  const auto x1 = x0 + b;
-  const auto d0 = x1 - x;
   const auto d1 = x - x0;
   assert(i0 <= (1 << kLog2ISineAngleScale) >> 2);
-  return (d0 * kISine[i0] + d1 * kISine[i0 + 1] + (b >> 1)) >> ds;
+  return kISine[i0] + ((d1 * (kISine[i0 + 1] - kISine[i0]) + (b >> 1)) >> ds);
 }
 
 //---------------------------------------------------------------------------

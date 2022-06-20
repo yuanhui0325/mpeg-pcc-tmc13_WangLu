@@ -53,6 +53,16 @@ write(const SequenceParameterSet& sps, const AttributeParameterSet& aps);
 PayloadBuffer
 write(const SequenceParameterSet& sps, const TileInventory& inventory);
 
+PayloadBuffer
+write(const SequenceParameterSet& sps, const FrameBoundaryMarker& fbm);
+
+PayloadBuffer write(
+  const SequenceParameterSet& sps,
+  const AttributeParamInventoryHdr& inventory,
+  const AttributeParameters& params);
+
+PayloadBuffer write(const UserData& ud);
+
 //----------------------------------------------------------------------------
 // NB: parseSps, parseGps, parseAps, and parseTileInventory return values
 //     using XYZ axes.
@@ -64,6 +74,14 @@ SequenceParameterSet parseSps(const PayloadBuffer& buf);
 GeometryParameterSet parseGps(const PayloadBuffer& buf);
 AttributeParameterSet parseAps(const PayloadBuffer& buf);
 TileInventory parseTileInventory(const PayloadBuffer& buf);
+FrameBoundaryMarker parseFrameBoundaryMarker(const PayloadBuffer& buf);
+UserData parseUserData(const PayloadBuffer& buf);
+
+AttributeParamInventoryHdr parseAttrParamInventoryHdr(const PayloadBuffer&);
+AttributeParameters& parseAttrParamInventory(
+  const AttributeDescription& attr,
+  const PayloadBuffer& buf,
+  AttributeParameters& params);
 
 //----------------------------------------------------------------------------
 
@@ -84,7 +102,8 @@ GeometryBrickHeader parseGbh(
   const SequenceParameterSet& sps,
   const GeometryParameterSet& gps,
   const PayloadBuffer& buf,
-  int* bytesRead);
+  int* bytesReadHead,
+  int* bytesReadFoot);
 
 AttributeBrickHeader parseAbh(
   const SequenceParameterSet& sps,
@@ -104,10 +123,11 @@ void write(
 GeometryBrickFooter parseGbf(
   const GeometryParameterSet& gps,
   const GeometryBrickHeader& gbh,
-  const PayloadBuffer& buf);
+  const PayloadBuffer& buf,
+  int* bytesRead);
 
 /**
- * Parse @buf, decoding only the parameter set, slice, tile.
+ * Parse @buf, decoding only the parameter set, slice, tag.
  * NB: the returned header is intentionally incomplete.
  */
 GeometryBrickHeader parseGbhIds(const PayloadBuffer& buf);

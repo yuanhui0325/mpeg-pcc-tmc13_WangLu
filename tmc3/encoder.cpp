@@ -36,6 +36,7 @@
 #include "PCCTMC3Encoder.h"
 
 #include <cassert>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -85,28 +86,42 @@ PCCTMC3Encoder3::compress(
   const PCCPointSet3& inputPointCloud,
   EncoderParams* params,
   PCCTMC3Encoder3::Callbacks* callback,
-  PCCPointSet3* reconstructedCloud)
+  CloudFrame* reconCloud)
 {
   // start of frame
   _frameCounter++;
 
   if (_frameCounter == 0) {
-    // Save encoder parameters
-    _geomPreScale = params->geomPreScale;
-    if (params->gps.predgeom_enabled_flag)
-      params->geomPreScale = 1.;
+    // Angular predictive geometry coding needs to determine spherical
+    // positions.  To avoid quantization of the input disturbing this:
+    //  - sequence scaling is replaced by decimation of the input
+    //  - any user-specified global scaling is honoured
+    _inputDecimationScale = 1.;
+    if (params->gps.predgeom_enabled_flag) {
+      _inputDecimationScale = params->codedGeomScale;
+      params->codedGeomScale /= params->seqGeomScale;
+      params->seqGeomScale = 1.;
+    }
 
     deriveParameterSets(params);
     fixupParameterSets(params);
 
+    _srcToCodingScale = params->codedGeomScale;
+
     // Determine input bounding box (for SPS metadata) if not manually set
     Box3<int> bbox;
-    if (params->sps.seqBoundingBoxSize == Vec3<int>{0})
+    if (params->autoSeqBbox)
       bbox = inputPointCloud.computeBoundingBox();
     else {
       bbox.min = params->sps.seqBoundingBoxOrigin;
       bbox.max = bbox.min + params->sps.seqBoundingBoxSize - 1;
     }
+
+    // Note whether the bounding box size is defined
+    // todo(df): set upper limit using level
+    bool bboxSizeDefined = params->sps.seqBoundingBoxSize > 0;
+    if (!bboxSizeDefined)
+      params->sps.seqBoundingBoxSize = (1 << 21) - 1;
 
     // Then scale the bounding box to match the reconstructed output
     for (int k = 0; k < 3; k++) {
@@ -116,22 +131,66 @@ PCCTMC3Encoder3::compress(
       // the sps bounding box is in terms of the conformance scale
       // not the source scale.
       // NB: plus one to convert to range
-      min_k = std::round(min_k * params->geomPreScale);
-      max_k = std::round(max_k * params->geomPreScale);
+      min_k = std::round(min_k * params->seqGeomScale);
+      max_k = std::round(max_k * params->seqGeomScale);
       params->sps.seqBoundingBoxOrigin[k] = min_k;
       params->sps.seqBoundingBoxSize[k] = max_k - min_k + 1;
+
+      // Compensate the sequence origin such that source point (0,0,0) coded
+      // as P_c is reconstructed as (0,0,0):
+      //   0 = P_c * globalScale + seqOrigin
+      auto gs = Rational(params->sps.globalScale);
+      int rem = params->sps.seqBoundingBoxOrigin[k] % gs.numerator;
+      rem += rem < 0 ? gs.numerator : 0;
+      params->sps.seqBoundingBoxOrigin[k] -= rem;
+      params->sps.seqBoundingBoxSize[k] += rem;
+
+      // Convert the origin to coding coordinate system
+      _originInCodingCoords[k] = params->sps.seqBoundingBoxOrigin[k];
+      _originInCodingCoords[k] /= double(gs);
     }
 
     // Determine the number of bits to signal the bounding box
-    params->sps.sps_bounding_box_offset_bits_minus1 =
-      numBits(params->sps.seqBoundingBoxOrigin.abs().max()) - 1;
+    params->sps.sps_bounding_box_offset_bits =
+      numBits(params->sps.seqBoundingBoxOrigin.abs().max());
 
-    params->sps.sps_bounding_box_size_bits_minus1 =
-      numBits(params->sps.seqBoundingBoxSize.abs().max()) - 1;
+    params->sps.sps_bounding_box_size_bits = bboxSizeDefined
+      ? numBits(params->sps.seqBoundingBoxSize.abs().max())
+      : 0;
 
-    // Determine the lidar head position relative to the sequence bounding box
-    params->gps.geomAngularOrigin *= params->geomPreScale;
-    params->gps.geomAngularOrigin -= params->sps.seqBoundingBoxOrigin;
+    // Determine the lidar head position in coding coordinate system
+    params->gps.gpsAngularOrigin *= _srcToCodingScale;
+    params->gps.gpsAngularOrigin -= _originInCodingCoords;
+
+    // determine the scale factors based on a characteristic of the
+    // acquisition system
+    if (params->gps.geom_angular_mode_enabled_flag) {
+      auto gs = Rational(params->sps.globalScale);
+      int maxX = (params->sps.seqBoundingBoxSize[0] - 1) / double(gs);
+      int maxY = (params->sps.seqBoundingBoxSize[1] - 1) / double(gs);
+      auto& origin = params->gps.gpsAngularOrigin;
+      int rx = std::max(std::abs(origin[0]), std::abs(maxX - origin[0]));
+      int ry = std::max(std::abs(origin[1]), std::abs(maxY - origin[1]));
+      int r = std::max(rx, ry);
+      int twoPi = 25735;
+      int maxLaserIdx = params->gps.numLasers() - 1;
+
+      if (params->gps.predgeom_enabled_flag) {
+        auto& gps = params->gps;
+        twoPi = 1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12);
+        r >>= params->gps.geom_angular_radius_inv_scale_log2;
+      }
+
+      // todo(df): handle the single laser case better
+      Box3<int> sphBox{0, {r, twoPi, maxLaserIdx}};
+      int refScale = params->gps.azimuth_scaling_enabled_flag
+        ? params->attrSphericalMaxLog2
+        : 0;
+      auto attr_coord_scale = normalisedAxesWeights(sphBox, refScale);
+      for (auto& aps : params->aps)
+        if (aps.spherical_coord_flag)
+          aps.attr_coord_scale = attr_coord_scale;
+    }
 
     // Allocate storage for attribute contexts
     _ctxtMemAttrs.resize(params->sps.attributeSets.size());
@@ -150,6 +209,12 @@ PCCTMC3Encoder3::compress(
   _sliceId = 0;
   _sliceOrigin = Vec3<int>{0};
   _firstSliceInFrame = true;
+
+  // Configure output coud
+  if (reconCloud) {
+    reconCloud->setParametersFrom(*_sps, params->outputFpBits);
+    reconCloud->frameNum = _frameCounter;
+  }
 
   // Partition the input point cloud into tiles
   //  - quantize the input point cloud (without duplicate point removal)
@@ -174,6 +239,10 @@ PCCTMC3Encoder3::compress(
   if (params->partition.tileSize) {
     tileMaps = tilePartition(params->partition, quantizedInput.cloud);
 
+    // To tag the slice with the tile id there must be sufficient bits.
+    // todo(df): determine sps parameter from the paritioning?
+    assert(numBits(tileMaps.size() - 1) <= _sps->slice_tag_bits);
+
     // Default is to use implicit tile ids (ie list index)
     partitions.tileInventory.tile_id_bits = 0;
 
@@ -182,6 +251,15 @@ PCCTMC3Encoder3::compress(
 
     // Get the bounding box of current tile and write it into tileInventory
     partitions.tileInventory.tiles.resize(tileMaps.size());
+
+    // Convert tile bounding boxes to sequence coordinate system.
+    // A position in the box must remain in the box after conversion
+    // irrispective of how the decoder outputs positions (fractional | integer)
+    //   => truncate origin (eg, rounding 12.5 to 13 would not allow all
+    //      decoders to find that point).
+    //   => use next integer for upper coordinate.
+    double gs = Rational(_sps->globalScale);
+
     for (int t = 0; t < tileMaps.size(); t++) {
       Box3<int32_t> bbox = quantizedInput.cloud.computeBoundingBox(
         tileMaps[t].begin(), tileMaps[t].end());
@@ -189,8 +267,10 @@ PCCTMC3Encoder3::compress(
       auto& tileIvt = partitions.tileInventory.tiles[t];
       tileIvt.tile_id = t;
       for (int k = 0; k < 3; k++) {
-        tileIvt.tileSize[k] = bbox.max[k] - bbox.min[k] + 1;
-        tileIvt.tileOrigin[k] = bbox.min[k];
+        auto origin = std::trunc(bbox.min[k] * gs);
+        auto size = std::ceil(bbox.max[k] * gs) - origin + 1;
+        tileIvt.tileOrigin[k] = origin;
+        tileIvt.tileSize[k] = size;
       }
     }
   } else {
@@ -207,6 +287,10 @@ PCCTMC3Encoder3::compress(
     inventory.ti_seq_parameter_set_id = _sps->sps_seq_parameter_set_id;
     inventory.ti_origin_bits_minus1 =
       numBits(inventory.origin.abs().max()) - 1;
+
+    // The inventory comes into force on the first frame
+    inventory.ti_frame_ctr_bits = _sps->frame_ctr_bits;
+    inventory.ti_frame_ctr = _frameCounter & ((1 << _sps->frame_ctr_bits) - 1);
 
     // Determine the number of bits for encoding tile sizes
     int maxValOrigin = 1;
@@ -312,9 +396,13 @@ PCCTMC3Encoder3::compress(
     _sliceId = partition.sliceId;
     _tileId = partition.tileId;
     _sliceOrigin = sliceCloud.computeBoundingBox().min;
-    compressPartition(
-      sliceCloud, sliceSrcCloud, params, callback, reconstructedCloud);
+    compressPartition(sliceCloud, sliceSrcCloud, params, callback, reconCloud);
   }
+
+  // Apply global scaling to reconstructed point cloud
+  if (reconCloud)
+    scaleGeometry(
+      reconCloud->cloud, _sps->globalScale, reconCloud->outputFpBits);
 
   return 0;
 }
@@ -324,22 +412,32 @@ PCCTMC3Encoder3::compress(
 void
 PCCTMC3Encoder3::deriveParameterSets(EncoderParams* params)
 {
-  // NB: Desrive the units based on srcResolution
-  if (params->srcResolution == 0.)
-    params->sps.seq_geom_scale_unit_flag = ScaleUnit::kDimensionless;
-  else
-    params->sps.seq_geom_scale_unit_flag = ScaleUnit::kPointsPerMetre;
+  // fixup extGeomScale in the case that we're coding metres
+  if (params->sps.seq_geom_scale_unit_flag == ScaleUnit::kMetre)
+    params->extGeomScale = 0;
 
-  // Derive the sps scale factor
-  switch (params->sps.seq_geom_scale_unit_flag) {
-  case ScaleUnit::kPointsPerMetre:
-    params->sps.seq_geom_scale = params->srcResolution * params->geomPreScale;
-    break;
+  if (params->extGeomScale == 0.)
+    params->extGeomScale = params->srcUnitLength;
 
-  case ScaleUnit::kDimensionless:
-    params->sps.seq_geom_scale = params->geomPreScale;
-    break;
-  }
+  // Derive the sps scale factor:  The sequence scale is normalised to an
+  // external geometry scale of 1.
+  //  - Ie, if the user specifies that extGeomScale=2 (1 seq point is equal
+  //    to 2 external points), seq_geom_scale is halved.
+  //
+  //  - In cases where the sequence scale is in metres, the external system
+  //    is defined to have a unit length of 1 metre, and srcUnitLength must
+  //    be used to define the sequence scale.
+  //  - The user may define the relationship to the external coordinate system.
+  //
+  // NB: seq_geom_scale is the reciprocal of unit length
+  params->sps.seqGeomScale = params->seqGeomScale / params->extGeomScale;
+
+  // Global scaling converts from the coded scale to the sequence scale
+  // NB: globalScale is constrained, eg 1.1 is not representable
+  // todo: consider adjusting seqGeomScale to make a valid globalScale
+  // todo: consider adjusting codedGeomScale to make a valid globalScale
+  params->sps.globalScale =
+    Rational(params->seqGeomScale / params->codedGeomScale);
 }
 
 //----------------------------------------------------------------------------
@@ -367,18 +465,30 @@ PCCTMC3Encoder3::fixupParameterSets(EncoderParams* params)
     params->sps.entropy_continuation_enabled_flag;
 
   // use one bit to indicate frame boundaries
-  params->sps.log2_max_frame_idx = 1;
+  params->sps.frame_ctr_bits = 1;
+
+  // number of bits for slice tag (tileid) if tiles partitioning enabled
+  // NB: the limit of 64 tiles is arbritrary
+  params->sps.slice_tag_bits = params->partition.tileSize > 0 ? 6 : 0;
 
   // slice origin parameters used by this encoder implementation
   params->gps.geom_box_log2_scale_present_flag = true;
   params->gps.gps_geom_box_log2_scale = 0;
 
+  // don't code per-slice angular origin
+  params->gps.geom_slice_angular_origin_present_flag = false;
+
   // derive the idcm qp offset from cli
   params->gps.geom_idcm_qp_offset = params->idcmQp - params->gps.geom_base_qp;
 
-  // intense IDCM imposes max threshold on IDCM
-  if (params->gps.inferred_direct_coding_mode > 1)
-    params->gps.geom_planar_idcm_threshold = 127;
+  // Feature dependencies
+  if (!params->gps.neighbour_avail_boundary_log2_minus1) {
+    params->gps.adjacent_child_contextualization_enabled_flag = 0;
+    params->gps.intra_pred_max_node_size_log2 = 0;
+  }
+
+  if (params->gps.predgeom_enabled_flag)
+    params->gps.geom_planar_mode_enabled_flag = false;
 
   // fixup attribute parameters
   for (auto it : params->attributeIdxMap) {
@@ -386,9 +496,50 @@ PCCTMC3Encoder3::fixupParameterSets(EncoderParams* params)
     auto& attr_aps = params->aps[it.second];
     auto& attr_enc = params->attr[it.second];
 
+    // this encoder does not (yet) support variable length attributes
+    // todo(df): add variable length attribute support
+    attr_aps.raw_attr_variable_len_flag = 0;
+
+    // sanitise any intra prediction skipping
+    if (attr_aps.attr_encoding != AttributeEncoding::kPredictingTransform)
+      attr_aps.intra_lod_prediction_skip_layers = attr_aps.kSkipAllLayers;
+    if (attr_aps.intra_lod_prediction_skip_layers < 0)
+      attr_aps.intra_lod_prediction_skip_layers = attr_aps.kSkipAllLayers;
+
+    // avoid signalling overly large values
+    attr_aps.intra_lod_prediction_skip_layers = std::min(
+      attr_aps.intra_lod_prediction_skip_layers,
+      attr_aps.maxNumDetailLevels() + 1);
+
     // dist2 is refined in the slice header
+    //  - the encoder always writes them unless syntatically prohibited:
     attr_aps.aps_slice_dist2_deltas_present_flag =
-      attr_aps.lodParametersPresent();
+      attr_aps.lodParametersPresent()
+      && !attr_aps.scalable_lifting_enabled_flag
+      && attr_aps.num_detail_levels_minus1
+      && attr_aps.lod_decimation_type != LodDecimationMethod::kPeriodic;
+
+    // disable dist2 estimation when decimating with centroid sampler
+    if (attr_aps.lod_decimation_type == LodDecimationMethod::kCentroid)
+      attr_aps.aps_slice_dist2_deltas_present_flag = false;
+
+    // If the lod search ranges are negative, use a full-range search
+    // todo(df): lookup level limit
+    if (attr_aps.inter_lod_search_range < 0)
+      attr_aps.inter_lod_search_range = 1100000;
+
+    if (attr_aps.intra_lod_search_range < 0)
+      attr_aps.intra_lod_search_range = 1100000;
+
+    // If all intra prediction layers are skipped, don't signal a search range
+    if (
+      attr_aps.intra_lod_prediction_skip_layers
+      > attr_aps.maxNumDetailLevels())
+      attr_aps.intra_lod_search_range = 0;
+
+    // If there are no refinement layers, don't signal an inter search range
+    if (attr_aps.maxNumDetailLevels() == 1)
+      attr_aps.inter_lod_search_range = 0;
 
     // the encoder options may not specify sufficient offsets for the number
     // of layers used by the sytax: extend with last value as appropriate
@@ -417,7 +568,7 @@ PCCTMC3Encoder3::compressPartition(
   const PCCPointSet3& originPartCloud,
   EncoderParams* params,
   PCCTMC3Encoder3::Callbacks* callback,
-  PCCPointSet3* reconstructedCloud)
+  CloudFrame* reconCloud)
 {
   // geometry compression consists of the following stages:
   //  - prefilter/quantize geometry (non-normative)
@@ -447,10 +598,11 @@ PCCTMC3Encoder3::compressPartition(
   _sliceBoxWhd = maxBound + 1;
 
   // apply a custom trisoup node size
-  params->gbh.trisoup_node_size_log2 = 0;
+  params->gbh.trisoup_node_size_log2_minus2 = 0;
   if (_gps->trisoup_enabled_flag) {
     int idx = std::min(_sliceId, int(params->trisoupNodeSizesLog2.size()) - 1);
-    params->gbh.trisoup_node_size_log2 = params->trisoupNodeSizesLog2[idx];
+    params->gbh.trisoup_node_size_log2_minus2 =
+      params->trisoupNodeSizesLog2[idx] - 2;
   }
 
   // geometry encoding
@@ -489,8 +641,8 @@ PCCTMC3Encoder3::compressPartition(
   if (_gps->geom_unique_points_flag || _gps->trisoup_enabled_flag) {
     for (const auto& attr_sps : _sps->attributeSets) {
       recolour(
-        attr_sps, params->recolour, originPartCloud, params->geomPreScale,
-        _sps->seqBoundingBoxOrigin + _sliceOrigin, &pointCloud);
+        attr_sps, params->recolour, originPartCloud, _srcToCodingScale,
+        _originInCodingCoords + _sliceOrigin, &pointCloud);
     }
   }
 
@@ -542,17 +694,24 @@ PCCTMC3Encoder3::compressPartition(
     // NB: this retains the original cartesian positions to restore afterwards
     std::vector<pcc::point_t> altPositions;
     if (attr_aps.spherical_coord_flag) {
-      altPositions.resize(pointCloud.getPointCount());
+      // If predgeom was used, re-use the internal positions rather than
+      // calculating afresh.
+      Box3<int> bboxRpl;
+      if (_gps->predgeom_enabled_flag) {
+        altPositions = _posSph;
+        bboxRpl = Box3<int>(altPositions.begin(), altPositions.end());
+      } else {
+        altPositions.resize(pointCloud.getPointCount());
 
-      auto laserOrigin = _gps->geomAngularOrigin - _sliceOrigin;
-      auto bboxRpl = convertXyzToRpl(
-        laserOrigin, _gps->geom_angular_theta_laser.data(),
-        _gps->geom_angular_theta_laser.size(), &pointCloud[0],
-        &pointCloud[0] + pointCloud.getPointCount(), altPositions.data());
+        auto laserOrigin = _gbh.geomAngularOrigin(*_gps);
+        bboxRpl = convertXyzToRpl(
+          laserOrigin, _gps->angularTheta.data(), _gps->angularTheta.size(),
+          &pointCloud[0], &pointCloud[0] + pointCloud.getPointCount(),
+          altPositions.data());
+      }
 
-      abh.attr_coord_conv_scale = normalisedAxesWeights(bboxRpl);
       offsetAndScale(
-        bboxRpl.min, abh.attr_coord_conv_scale, altPositions.data(),
+        bboxRpl.min, attr_aps.attr_coord_scale, altPositions.data(),
         altPositions.data() + altPositions.size());
 
       pointCloud.swapPoints(altPositions);
@@ -602,7 +761,8 @@ PCCTMC3Encoder3::compressPartition(
   _sliceId++;
   _firstSliceInFrame = false;
 
-  appendReconstructedPoints(reconstructedCloud);
+  if (reconCloud)
+    appendSlice(reconCloud->cloud);
 }
 
 //----------------------------------------------------------------------------
@@ -615,15 +775,17 @@ PCCTMC3Encoder3::encodeGeometryBrick(
   gbh.geom_geom_parameter_set_id = _gps->gps_geom_parameter_set_id;
   gbh.geom_slice_id = _sliceId;
   gbh.prev_slice_id = _prevSliceId;
-  gbh.geom_tile_id = std::max(0, _tileId);
-  gbh.frame_idx = _frameCounter & ((1 << _sps->log2_max_frame_idx) - 1);
+  // NB: slice_tag could be set to some other (external) meaningful value
+  gbh.slice_tag = std::max(0, _tileId);
+  gbh.frame_ctr_lsb = _frameCounter & ((1 << _sps->frame_ctr_bits) - 1);
   gbh.geomBoxOrigin = _sliceOrigin;
+  gbh.gbhAngularOrigin = _gps->gpsAngularOrigin - _sliceOrigin;
   gbh.geom_box_origin_bits_minus1 = numBits(gbh.geomBoxOrigin.max()) - 1;
   gbh.geom_box_log2_scale = 0;
   gbh.geom_slice_qp_offset = params->gbh.geom_slice_qp_offset;
-  gbh.geom_octree_qp_offset_depth = params->gbh.geom_octree_qp_offset_depth;
   gbh.geom_stream_cnt_minus1 = params->gbh.geom_stream_cnt_minus1;
-  gbh.trisoup_node_size_log2 = params->gbh.trisoup_node_size_log2;
+  gbh.trisoup_node_size_log2_minus2 =
+    params->gbh.trisoup_node_size_log2_minus2;
 
   gbh.geom_qp_offset_intvl_log2_delta =
     params->gbh.geom_qp_offset_intvl_log2_delta;
@@ -643,7 +805,7 @@ PCCTMC3Encoder3::encodeGeometryBrick(
     // NB: the following isn't strictly necessary, but avoids accidents
     // involving the qtbt derivation.
     gbh.rootNodeSizeLog2[k] =
-      std::max(gbh.trisoup_node_size_log2, gbh.rootNodeSizeLog2[k]);
+      std::max(gbh.trisoupNodeSizeLog2(*_gps), gbh.rootNodeSizeLog2[k]);
   }
   gbh.maxRootNodeDimLog2 = gbh.rootNodeSizeLog2.max();
 
@@ -664,18 +826,16 @@ PCCTMC3Encoder3::encodeGeometryBrick(
   }
 
   // forget (reset) all saved context state at boundary
-  if (_sps->entropy_continuation_enabled_flag) {
-    if (!gbh.entropy_continuation_flag) {
-      _ctxtMemOctreeGeom->reset();
-      _ctxtMemPredGeom->reset();
-      for (auto& ctxtMem : _ctxtMemAttrs)
-        ctxtMem.reset();
-    }
+  if (!gbh.entropy_continuation_flag) {
+    _ctxtMemOctreeGeom->reset();
+    _ctxtMemPredGeom->reset();
+    for (auto& ctxtMem : _ctxtMemAttrs)
+      ctxtMem.reset();
   }
 
   if (_gps->predgeom_enabled_flag)
     encodePredictiveGeometry(
-      params->predGeom, *_gps, gbh, pointCloud, *_ctxtMemPredGeom,
+      params->predGeom, *_gps, gbh, pointCloud, &_posSph, *_ctxtMemPredGeom,
       arithmeticEncoders[0].get());
   else if (!_gps->trisoup_enabled_flag)
     encodeGeometryOctree(
@@ -693,26 +853,29 @@ PCCTMC3Encoder3::encodeGeometryBrick(
   // signal the actual number of points coded
   gbh.footer.geom_num_points_minus1 = pointCloud.getPointCount() - 1;
 
-  // determine the length of each sub-stream
-  for (auto& arithmeticEncoder : arithmeticEncoders) {
-    auto dataLen = arithmeticEncoder->stop();
-    gbh.geom_stream_len.push_back(dataLen);
-  }
-
-  // determine the number of bits to use for the offset fields
-  // NB: don't include the last offset since it isn't signalled
-  if (gbh.geom_stream_cnt_minus1) {
-    size_t maxOffset = *std::max_element(
-      gbh.geom_stream_len.begin(), std::prev(gbh.geom_stream_len.end()));
-    gbh.geom_stream_len_bits = ceillog2(maxOffset + 1);
-  }
-
   // assemble data unit
+  //  - record the position of each aec buffer for chunk concatenation
+  std::vector<std::pair<size_t, size_t>> aecStreams;
   write(*_sps, *_gps, gbh, buf);
-  for (int i = 0; i < 1 + gbh.geom_stream_cnt_minus1; i++) {
-    auto& aec = arithmeticEncoders[i];
-    auto dataLen = gbh.geom_stream_len[i];
-    std::copy_n(aec->buffer(), dataLen, std::back_inserter(*buf));
+  for (auto& arithmeticEncoder : arithmeticEncoders) {
+    auto aecLen = arithmeticEncoder->stop();
+    auto aecBuf = arithmeticEncoder->buffer();
+    aecStreams.emplace_back(buf->size(), aecLen);
+    buf->insert(buf->end(), aecBuf, aecBuf + aecLen);
+  }
+
+  // This process is performed here from the last chunk to the first.  It
+  // is also possible to implement this in a forwards direction too.
+  if (_sps->cabac_bypass_stream_enabled_flag) {
+    aecStreams.pop_back();
+    for (auto i = aecStreams.size() - 1; i + 1; i--) {
+      auto& stream = aecStreams[i];
+      auto* ptr = reinterpret_cast<uint8_t*>(buf->data());
+      auto* chunkA = ptr + stream.first + (stream.second & ~0xff);
+      auto* chunkB = ptr + stream.first + stream.second;
+      auto* end = ptr + buf->size();
+      ChunkStreamBuilder::spliceChunkStreams(chunkA, chunkB, end);
+    }
   }
 
   // append the footer
@@ -725,28 +888,15 @@ PCCTMC3Encoder3::encodeGeometryBrick(
 //----------------------------------------------------------------------------
 
 void
-PCCTMC3Encoder3::appendReconstructedPoints(PCCPointSet3* reconstructedCloud)
+PCCTMC3Encoder3::appendSlice(PCCPointSet3& accumCloud)
 {
-  if (reconstructedCloud == nullptr) {
-    return;
-  }
-  const size_t pointCount = pointCloud.getPointCount();
-  size_t outIdx = reconstructedCloud->getPointCount();
+  // offset current point cloud to be in coding coordinate system
+  size_t numPoints = pointCloud.getPointCount();
+  for (size_t i = 0; i < numPoints; i++)
+    for (int k = 0; k < 3; k++)
+      pointCloud[i][k] += _sliceOrigin[k];
 
-  reconstructedCloud->addRemoveAttributes(
-    pointCloud.hasColors(), pointCloud.hasReflectances());
-  reconstructedCloud->resize(outIdx + pointCount);
-
-  for (size_t i = 0; i < pointCount; ++i, ++outIdx) {
-    (*reconstructedCloud)[outIdx] = pointCloud[i] + _sliceOrigin;
-
-    if (pointCloud.hasColors()) {
-      reconstructedCloud->setColor(outIdx, pointCloud.getColor(i));
-    }
-    if (pointCloud.hasReflectances()) {
-      reconstructedCloud->setReflectance(outIdx, pointCloud.getReflectance(i));
-    }
-  }
+  accumCloud.append(pointCloud);
 }
 
 //----------------------------------------------------------------------------
@@ -760,21 +910,22 @@ PCCTMC3Encoder3::quantization(const PCCPointSet3& src)
   assert(_sps->seqBoundingBoxSize != Vec3<int>{0});
 
   // Clamp all points to [clampBox.min, clampBox.max] after translation
-  // and quantisation.   NB: minus 1 to convert to max s/t/v position
-  Box3<int32_t> clampBox(0, _sps->seqBoundingBoxSize - 1);
+  // and quantisation.
+  Box3<int32_t> clampBox(0, std::numeric_limits<int32_t>::max());
 
   // When using predictive geometry, sub-sample the point cloud and let
   // the predictive geometry coder quantise internally.
-  if (_gps->predgeom_enabled_flag && _gps->geom_unique_points_flag)
-    return samplePositionsUniq(_geomPreScale, _sps->seqBoundingBoxOrigin, src);
+  if (_inputDecimationScale != 1.)
+    return samplePositionsUniq(
+      _inputDecimationScale, _srcToCodingScale, _originInCodingCoords, src);
 
   if (_gps->geom_unique_points_flag)
     return quantizePositionsUniq(
-      _geomPreScale, _sps->seqBoundingBoxOrigin, clampBox, src);
+      _srcToCodingScale, _originInCodingCoords, clampBox, src);
 
   SrcMappedPointSet dst;
   quantizePositions(
-    _geomPreScale, _sps->seqBoundingBoxOrigin, clampBox, src, &dst.cloud);
+    _srcToCodingScale, _originInCodingCoords, clampBox, src, &dst.cloud);
   return dst;
 }
 
@@ -785,7 +936,7 @@ PCCPointSet3
 getPartition(const PCCPointSet3& src, const std::vector<int32_t>& indexes)
 {
   PCCPointSet3 dst;
-  dst.addRemoveAttributes(src.hasColors(), src.hasReflectances());
+  dst.addRemoveAttributes(src);
 
   int partitionSize = indexes.size();
   dst.resize(partitionSize);
@@ -799,6 +950,9 @@ getPartition(const PCCPointSet3& src, const std::vector<int32_t>& indexes)
 
     if (src.hasReflectances())
       dst.setReflectance(i, src.getReflectance(inputIdx));
+
+    if (src.hasLaserAngles())
+      dst.setLaserAngle(i, src.getLaserAngle(inputIdx));
   }
 
   return dst;
@@ -830,7 +984,7 @@ getPartition(
   }
 
   PCCPointSet3 dst;
-  dst.addRemoveAttributes(src.hasColors(), src.hasReflectances());
+  dst.addRemoveAttributes(src);
   dst.resize(size);
 
   int dstIdx = 0;
@@ -844,6 +998,9 @@ getPartition(
 
       if (src.hasReflectances())
         dst.setReflectance(dstIdx, src.getReflectance(srcIdx));
+
+      if (src.hasLaserAngles())
+        dst.setLaserAngle(dstIdx, src.getLaserAngle(srcIdx));
 
       dstIdx++;
       prevIdx = srcIdx;

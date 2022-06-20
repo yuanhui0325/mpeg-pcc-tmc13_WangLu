@@ -51,17 +51,39 @@ using namespace pcc;
 
 //============================================================================
 
+enum class OutputSystem
+{
+  // Output after global scaling, don't convert to external system
+  kConformance = 0,
+
+  // Scale output to external coordinate system
+  kExternal = 1,
+};
+
+//----------------------------------------------------------------------------
+
 struct Parameters {
   bool isDecoder;
 
   // command line parsing should adjust dist2 values according to PQS
   bool positionQuantizationScaleAdjustsDist2;
 
+  // Scale factor to apply when loading the ply before integer conversion.
+  // Eg, If source point positions are in fractional metres converting to
+  // millimetres will allow some fidelity to be preserved.
+  double inputScale;
+
+  // Length of the output point clouds unit vectors.
+  double outputUnitLength;
+
   // output mode for ply writing (binary or ascii)
   bool outputBinaryPly;
 
-  // output ply resolution in points per metre (or 0 for undefined)
-  float outputResolution;
+  // Fractional fixed-point bits retained in conformance output
+  int outputFpBits;
+
+  // Output coordinate system to use
+  OutputSystem outputSystem;
 
   // when true, configure the encoder as if no attributes are specified
   bool disableAttributeCoding;
@@ -88,24 +110,51 @@ struct Parameters {
   // perform attribute colourspace conversion on ply input/output.
   bool convertColourspace;
 
-  // todo(df): this should be per-attribute
-  int reflectanceScale;
-
   // resort the input points by azimuth angle
   bool sortInputByAzimuth;
 };
 
 //----------------------------------------------------------------------------
 
-class SequenceEncoder : public PCCTMC3Encoder3::Callbacks {
+class SequenceCodec {
+public:
+  // NB: params must outlive the lifetime of the decoder.
+  SequenceCodec(Parameters* params) : params(params) {}
+
+  // Perform conversions and write output point cloud
+  //  \params cloud  a mutable copy of reconFrame.cloud
+  void writeOutputFrame(
+    const std::string& postInvScalePath,
+    const std::string& preInvScalePath,
+    const CloudFrame& reconFrame,
+    PCCPointSet3& cloud);
+
+  // determine the output ply scale factor
+  double outputScale(const CloudFrame& cloud) const;
+
+  // the output ply origin, scaled according to output coordinate system
+  Vec3<double> outputOrigin(const CloudFrame& cloud) const;
+
+  void scaleAttributesForInput(
+    const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud);
+
+  void scaleAttributesForOutput(
+    const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud);
+
+protected:
+  Parameters* params;
+};
+
+//----------------------------------------------------------------------------
+
+class SequenceEncoder
+  : public SequenceCodec
+  , PCCTMC3Encoder3::Callbacks {
 public:
   // NB: params must outlive the lifetime of the decoder.
   SequenceEncoder(Parameters* params);
 
   int compress(Stopwatch* clock);
-
-  // determine the output ply scale factor
-  double outputScale(const SequenceParameterSet& sps);
 
 protected:
   int compressOneFrame(Stopwatch* clock);
@@ -119,7 +168,6 @@ private:
   // The raw origin used for input sorting
   Vec3<int> _angularOrigin;
 
-  Parameters* params;
   PCCTMC3Encoder3 encoder;
 
   std::ofstream bytestreamFile;
@@ -129,35 +177,33 @@ private:
 
 //----------------------------------------------------------------------------
 
-class SequenceDecoder : public PCCTMC3Decoder3::Callbacks {
+class SequenceDecoder
+  : public SequenceCodec
+  , PCCTMC3Decoder3::Callbacks {
 public:
   // NB: params must outlive the lifetime of the decoder.
-  SequenceDecoder(const Parameters* params);
+  SequenceDecoder(Parameters* params);
 
   int decompress(Stopwatch* clock);
 
-  // determine the output ply scale factor
-  double outputScale(const SequenceParameterSet& sps);
-
 protected:
-  void onOutputCloud(
-    const SequenceParameterSet& sps,
-    const PCCPointSet3& decodedPointCloud) override;
+  void onOutputCloud(const CloudFrame& cloud) override;
 
 private:
-  const Parameters* params;
   PCCTMC3Decoder3 decoder;
 
   std::ofstream bytestreamFile;
 
-  int frameNum;
   Stopwatch* clock;
 };
 
 //============================================================================
 
-void convertToGbr(const SequenceParameterSet& sps, PCCPointSet3& cloud);
-void convertFromGbr(const SequenceParameterSet& sps, PCCPointSet3& cloud);
+void convertToGbr(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud);
+
+void convertFromGbr(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud);
 
 //============================================================================
 
@@ -230,6 +276,34 @@ readUInt(std::istream& in, T& val)
 
 namespace pcc {
 static std::istream&
+operator>>(std::istream& in, ScaleUnit& val)
+{
+  try {
+    readUInt(in, val);
+  }
+  catch (...) {
+    in.clear();
+    std::string str;
+    in >> str;
+
+    val = ScaleUnit::kDimensionless;
+    if (str == "metre")
+      val = ScaleUnit::kMetre;
+    else if (!str.empty())
+      throw std::runtime_error("Cannot parse unit");
+  }
+  return in;
+}
+}  // namespace pcc
+
+static std::istream&
+operator>>(std::istream& in, OutputSystem& val)
+{
+  return readUInt(in, val);
+}
+
+namespace pcc {
+static std::istream&
 operator>>(std::istream& in, ColourMatrix& val)
 {
   return readUInt(in, val);
@@ -254,6 +328,14 @@ operator>>(std::istream& in, AttributeEncoding& val)
 
 namespace pcc {
 static std::istream&
+operator>>(std::istream& in, LodDecimationMethod& val)
+{
+  return readUInt(in, val);
+}
+}  // namespace pcc
+
+namespace pcc {
+static std::istream&
 operator>>(std::istream& in, PartitionMethod& val)
 {
   return readUInt(in, val);
@@ -265,6 +347,36 @@ static std::istream&
 operator>>(std::istream& in, PredGeomEncOpts::SortMode& val)
 {
   return readUInt(in, val);
+}
+}  // namespace pcc
+
+namespace pcc {
+static std::istream&
+operator>>(std::istream& in, OctreeEncOpts::QpMethod& val)
+{
+  return readUInt(in, val);
+}
+}  // namespace pcc
+
+static std::ostream&
+operator<<(std::ostream& out, const OutputSystem& val)
+{
+  switch (val) {
+  case OutputSystem::kConformance: out << "0 (Conformance)"; break;
+  case OutputSystem::kExternal: out << "1 (External)"; break;
+  }
+  return out;
+}
+
+namespace pcc {
+static std::ostream&
+operator<<(std::ostream& out, const ScaleUnit& val)
+{
+  switch (val) {
+  case ScaleUnit::kDimensionless: out << "0 (Dimensionless)"; break;
+  case ScaleUnit::kMetre: out << "1 (Metre)"; break;
+  }
+  return out;
 }
 }  // namespace pcc
 
@@ -316,9 +428,23 @@ static std::ostream&
 operator<<(std::ostream& out, const AttributeEncoding& val)
 {
   switch (val) {
-  case AttributeEncoding::kPredictingTransform: out << "0 (Pred)"; break;
-  case AttributeEncoding::kRAHTransform: out << "1 (RAHT)"; break;
+  case AttributeEncoding::kRAHTransform: out << "0 (RAHT)"; break;
+  case AttributeEncoding::kPredictingTransform: out << "1 (Pred)"; break;
   case AttributeEncoding::kLiftingTransform: out << "2 (Lift)"; break;
+  case AttributeEncoding::kRaw: out << "3 (Raw)"; break;
+  }
+  return out;
+}
+}  // namespace pcc
+
+namespace pcc {
+static std::ostream&
+operator<<(std::ostream& out, const LodDecimationMethod& val)
+{
+  switch (val) {
+  case LodDecimationMethod::kNone: out << "0 (None)"; break;
+  case LodDecimationMethod::kPeriodic: out << "1 (Periodic)"; break;
+  case LodDecimationMethod::kCentroid: out << "2 (Centroid)"; break;
   }
   return out;
 }
@@ -333,6 +459,7 @@ operator<<(std::ostream& out, const PartitionMethod& val)
   case PartitionMethod::kUniformGeom: out << "2 (UniformGeom)"; break;
   case PartitionMethod::kOctreeUniform: out << "3 (UniformOctree)"; break;
   case PartitionMethod::kUniformSquare: out << "4 (UniformSquare)"; break;
+  case PartitionMethod::kNpoints: out << "5 (NPointSpans)"; break;
   default: out << int(val) << " (Unknown)"; break;
   }
   return out;
@@ -349,6 +476,22 @@ operator<<(std::ostream& out, const PredGeomEncOpts::SortMode& val)
   case SortMode::kSortMorton: out << int(val) << " (Morton)"; break;
   case SortMode::kSortAzimuth: out << int(val) << " (Azimuth)"; break;
   case SortMode::kSortRadius: out << int(val) << " (Radius)"; break;
+  case SortMode::kSortLaserAngle: out << int(val) << " (LaserAngle)"; break;
+  default: out << int(val) << " (Unknown)"; break;
+  }
+  return out;
+}
+}  // namespace pcc
+
+namespace pcc {
+static std::ostream&
+operator<<(std::ostream& out, const OctreeEncOpts::QpMethod& val)
+{
+  switch (val) {
+    using Method = OctreeEncOpts::QpMethod;
+  case Method::kUniform: out << int(val) << " (Uniform)"; break;
+  case Method::kRandom: out << int(val) << " (Random)"; break;
+  case Method::kByDensity: out << int(val) << " (ByDensity)"; break;
   default: out << int(val) << " (Unknown)"; break;
   }
   return out;
@@ -374,6 +517,11 @@ namespace program_options_lite {
 
 //---------------------------------------------------------------------------
 // :: Command line / config parsing
+
+void sanitizeEncoderOpts(
+  Parameters& params, df::program_options_lite::ErrorReporter& err);
+
+//---------------------------------------------------------------------------
 
 bool
 ParseParameters(int argc, char* argv[], Parameters& params)
@@ -439,7 +587,7 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   // i/o parameters
   ("firstFrameNum",
      params.firstFrameNum, 0,
-     "Frame number for use with interpolating %d format specifiers"
+     "Frame number for use with interpolating %d format specifiers "
      "in input/output filenames")
 
   ("frameCount",
@@ -466,36 +614,77 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     params.preInvScalePath, {},
     "Pre inverse scaled pointcloud file path (decoder only)")
 
-  ("outputBinaryPly",
-    params.outputBinaryPly, false,
-    "Output ply files using binary (or otherwise ascii) format")
-
-  ("outputResolution",
-    params.outputResolution, -1.f,
-    "Resolution of output point cloud in points per metre")
-
   ("convertPlyColourspace",
     params.convertColourspace, true,
     "Convert ply colourspace according to attribute colourMatrix")
 
-  // general
-  // todo(df): this should be per-attribute
-  ("hack.reflectanceScale",
-    params.reflectanceScale, 1,
-    "scale factor to be applied to reflectance "
-    "pre encoding / post reconstruction")
+  ("outputBinaryPly",
+    params.outputBinaryPly, false,
+    "Output ply files using binary (or ascii) format")
+
+  ("outputUnitLength",
+    params.outputUnitLength, 0.,
+    "Length of reconstructed point cloud x,y,z unit vectors\n"
+    " 0: use srcUnitLength")
+
+  ("outputScaling",
+    params.outputSystem, OutputSystem::kExternal,
+    "Output coordnate system scaling\n"
+    " 0: Conformance\n"
+    " 1: External")
+
+  ("outputPrecisionBits",
+    params.outputFpBits, -1,
+    "Fractional bits in conformance output (prior to external scaling)\n"
+    " 0: integer,  -1: automatic (full)")
+
+  // This section controls all general geometry scaling parameters
+  (po::Section("Coordinate system scaling"))
+
+  ("srcUnitLength",
+    params.encoder.srcUnitLength, 1.,
+    "Length of source point cloud x,y,z unit vectors in srcUnits")
+
+  ("srcUnit",
+    params.encoder.sps.seq_geom_scale_unit_flag, ScaleUnit::kDimensionless,
+    " 0: dimensionless\n 1: metres")
+
+  ("inputScale",
+    params.inputScale, 1.,
+    "Scale input while reading src ply. "
+    "Eg, 1000 converts metres to integer millimetres")
+
+  ("codingScale",
+    params.encoder.codedGeomScale, 1.,
+    "Scale used to represent coded geometry. Relative to inputScale")
+
+  ("sequenceScale",
+    params.encoder.seqGeomScale, 1.,
+    "Scale used to obtain sequence coordinate system. "
+    "Relative to inputScale")
+
+  // Alias for compatibility with old name.
+  ("positionQuantizationScale", params.encoder.seqGeomScale, 1.,
+   "(deprecated)")
+
+  ("externalScale",
+    params.encoder.extGeomScale, 1.,
+    "Scale used to define external coordinate system.\n"
+    "Meaningless when srcUnit = metres\n"
+    "  0: Use srcUnitLength\n"
+    " >0: Relative to inputScale")
 
   (po::Section("Decoder"))
 
   ("skipOctreeLayers",
     params.decoder.minGeomNodeSizeLog2, 0,
-    " 0   : Full decode. \n"
-    " N>0 : Skip the bottom N layers in decoding process.\n"
-    " skipLayerNum indicates the number of skipped lod layers from leaf lod.")
+    "Partial decoding of octree and attributes\n"
+    " 0   : Full decode\n"
+    " N>0 : Skip the bottom N layers in decoding process")
 
   ("decodeMaxPoints",
     params.decoder.decodeMaxPoints, 0,
-    "Partially decode up to N points\n")
+    "Partially decode up to N points")
 
   (po::Section("Encoder"))
 
@@ -510,30 +699,25 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "  3: (yzx)\n  4: (zyx)\n  5: (zxy)\n"
     "  6: (yxz)\n  7: (xyz)")
 
+  ("autoSeqBbox",
+    params.encoder.autoSeqBbox, true,
+    "Calculate seqOrigin and seqSizeWhd automatically.")
+
   // NB: the underlying variable is in STV order.
   //     Conversion happens during argument sanitization.
-  ("seq_bounding_box_xyz0",
+  ("seqOrigin",
     params.encoder.sps.seqBoundingBoxOrigin, {0},
-    "Origin (x,y,z) of the sequence bounding box. "
-    "NB: seq_bounding_box_whd must be set for paramter to have an effect")
+    "Origin (x,y,z) of the sequence bounding box "
+    "(in input coordinate system). "
+    "Requires autoSeqBbox=0")
 
   // NB: the underlying variable is in STV order.
   //     Conversion happens during argument sanitization.
-  ("seq_bounding_box_whd",
+  ("seqSizeWhd",
     params.encoder.sps.seqBoundingBoxSize, {0},
-    "seq_bounding_box_whd")
-
-  ("srcResolution",
-    params.encoder.srcResolution, 0.f,
-    "Resolution of source point cloud in points per metre")
-
-  ("positionQuantizationScale",
-    params.encoder.geomPreScale, 1.f,
-    "Scale factor to be applied to point positions during pre-processing")
-
-  ("positionQuantizationScaleAdjustsDist2",
-    params.positionQuantizationScaleAdjustsDist2, false,
-    "Scale dist2 values by squared positionQuantizationScale")
+    "Size of the sequence bounding box "
+    "(in input coordinate system). "
+    "Requires autoSeqBbox=0")
 
   ("mergeDuplicatedPoints",
     params.encoder.gps.geom_unique_points_flag, true,
@@ -543,10 +727,10 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     params.encoder.partition.method, PartitionMethod::kUniformSquare,
     "Method used to partition input point cloud into slices/tiles:\n"
     "  0: none\n"
-    "  1: none (deprecated)\n"
-    "  2: n Uniform-Geometry partition bins along the longest edge\n"
-    "  3: Uniform Geometry partition at n octree depth\n"
-    "  4: Uniform Square partition")
+    "  2: n Uniform-geometry partition bins along the longest edge\n"
+    "  3: Uniform geometry partition at n octree depth\n"
+    "  4: Uniform square partition\n"
+    "  5: n-point spans of input")
 
   ("partitionOctreeDepth",
     params.encoder.partition.octreeDepth, 1,
@@ -584,7 +768,7 @@ ParseParameters(int argc, char* argv[], Parameters& params)
 
   ("geomTreeType",
     params.encoder.gps.predgeom_enabled_flag, false,
-    "Selects the tree coding method\n"
+    "Selects the tree coding method:\n"
     "  0: octree\n"
     "  1: predictive")
 
@@ -612,9 +796,10 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "  1: bitwise")
 
   ("neighbourAvailBoundaryLog2",
-    params.encoder.gps.neighbour_avail_boundary_log2, 0,
+    // NB: this is adjusted by minus 1 after the arguments are parsed
+    params.encoder.gps.neighbour_avail_boundary_log2_minus1, 0,
     "Defines the avaliability volume for neighbour occupancy lookups:\n"
-    " 0: Limited to sibling nodes only")
+    "<2: Limited to sibling nodes only")
 
   ("inferredDirectCodingMode",
     params.encoder.gps.inferred_direct_coding_mode, 1,
@@ -656,14 +841,15 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Lower values imply more use of the third planar mode")
 
    ("planarModeIdcmUse",
-    params.encoder.gps.geom_planar_idcm_threshold, 0,
-    "Degree (0-127) of IDCM activation when planar mode is enabled.\n"
-    "  0 => never, 127 => always")
+    // NB: this is adjusted by minus1 after thearguments are parsed
+    params.encoder.gps.geom_idcm_rate_minus1, 0,
+    "Degree (1/32%) of IDCM activation when planar mode is enabled\n"
+    "  0 => never, 32 => always")
 
   ("trisoupNodeSizeLog2",
     params.encoder.trisoupNodeSizesLog2, {0},
-    "Node size for surface triangulation.\n"
-    "  0: disabled")
+    "Node size for surface triangulation\n"
+    " <2: disabled")
 
   ("trisoup_sampling_value",
     params.encoder.gps.trisoup_sampling_value, 0,
@@ -673,6 +859,13 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   ("positionQuantisationEnabled",
     params.encoder.gps.geom_scaling_enabled_flag, false,
     "Enable in-loop quantisation of positions")
+
+  ("positionQuantisationMethod",
+    params.encoder.geom.qpMethod, OctreeEncOpts::QpMethod::kUniform,
+    "Method used to determine per-node QP:\n"
+    "  0: uniform\n"
+    "  1: random\n"
+    "  2: by node point density")
 
   ("positionQpMultiplierLog2",
     params.encoder.gps.geom_qp_multiplier_log2, 0,
@@ -691,8 +884,13 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     params.encoder.gbh.geom_slice_qp_offset, 0,
     "Per-slice QP offset used in position quantisation")
 
+  ("positionQuantisationOctreeSizeLog2",
+    params.encoder.geom.qpOffsetNodeSizeLog2, -1,
+    "Octree node size used for signalling position QP offsets "
+    "(-1 => disabled)")
+
   ("positionQuantisationOctreeDepth",
-    params.encoder.gbh.geom_octree_qp_offset_depth, -1,
+    params.encoder.geom.qpOffsetDepth, -1,
     "Octree depth used for signalling position QP offsets (-1 => disabled)")
 
   ("positionBaseQpFreqLog2",
@@ -711,8 +909,8 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   // NB: the underlying variable is in STV order.
   //     Conversion happens during argument sanitization.
   ("lidarHeadPosition",
-    params.encoder.gps.geomAngularOrigin, {0, 0, 0},
-    "laser head position (x, y, z) in angular mode")
+    params.encoder.gps.gpsAngularOrigin, {0, 0, 0},
+    "laser head position (x,y,z) in angular mode")
 
   ("numLasers",
     params.encoder.numLasers, 0,
@@ -727,19 +925,24 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Vertical laser offset in angular mode")
 
   ("lasersNumPhiPerTurn",
-    params.encoder.gps.geom_angular_num_phi_per_turn, {},
+    params.encoder.gps.angularNumPhiPerTurn, {},
     "Number of sampling poisitions in a complete laser turn in angular mode")
 
   ("planarBufferDisabled",
     params.encoder.gps.planar_buffer_disabled_flag, false,
     "Disable planar buffer (when angular mode is enabled)")
 
-  ("positionAzimuthScaleLog2",
-    params.encoder.gps.geom_angular_azimuth_scale_log2, 17,
-    "Scale factor applied to azimuth angle in predictive geometry coding")
+  ("predGeomAzimuthQuantization",
+    params.encoder.gps.azimuth_scaling_enabled_flag, true,
+    "Quantize azimuth according to radius in predictive geometry coding")
 
+  ("positionAzimuthScaleLog2",
+    params.encoder.gps.geom_angular_azimuth_scale_log2_minus11, 5,
+    "Additional bits to represent azimuth angle in predictive geometry coding")
+
+  // NB: this will be corrected to be minus 1 later
   ("positionAzimuthSpeed",
-    params.encoder.gps.geom_angular_azimuth_speed, 363,
+    params.encoder.gps.geom_angular_azimuth_speed_minus1, 363,
     "Scale factor applied to azimuth angle in predictive geometry coding")
 
   ("positionRadiusInvScaleLog2",
@@ -751,8 +954,8 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Predictive geometry tree construction order")
 
   ("predGeomAzimuthSortPrecision",
-    params.encoder.predGeom.azimuthSortRecipBinWidth, 0,
-    "Reciprocal precision used in azimuthal sorting for tree construction\n")
+    params.encoder.predGeom.azimuthSortRecipBinWidth, 0.0f,
+    "Reciprocal precision used in azimuthal sorting for tree construction")
 
   ("predGeomTreePtsMax",
     params.encoder.predGeom.maxPtsPerTree, 1100000,
@@ -771,17 +974,26 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Encode the given attribute (NB, must appear after the"
     "following attribute parameters)")
 
+  // NB: the cli option sets +1, the minus1 will be applied later
+  ("attrScale",
+    params_attr.desc.params.attr_scale_minus1, 1,
+    "Scale factor used to interpret coded attribute values")
+
+  ("attrOffset",
+    params_attr.desc.params.attr_offset, 0,
+    "Offset used to interpret coded attribute values")
+
   ("bitdepth",
     params_attr.desc.bitdepth, 8,
     "Attribute bitdepth")
 
   ("defaultValue",
-    params_attr.desc.attr_default_value, {},
+    params_attr.desc.params.attr_default_value, {},
     "Default attribute component value(s) in case of data omission")
 
   // todo(df): this should be per-attribute
   ("colourMatrix",
-    params_attr.desc.cicp_matrix_coefficients_idx, ColourMatrix::kBt709,
+    params_attr.desc.params.cicp_matrix_coefficients_idx, ColourMatrix::kBt709,
     "Matrix used in colourspace conversion\n"
     "  0: none (identity)\n"
     "  1: ITU-T BT.709\n"
@@ -790,9 +1002,13 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   ("transformType",
     params_attr.aps.attr_encoding, AttributeEncoding::kPredictingTransform,
     "Coding method to use for attribute:\n"
-    "  0: Hierarchical neighbourhood prediction\n"
-    "  1: Region Adaptive Hierarchical Transform (RAHT)\n"
-    "  2: Hierarichical neighbourhood prediction as lifting transform")
+    "  0: Region Adaptive Hierarchical Transform (RAHT)\n"
+    "  1: Hierarchical neighbourhood prediction\n"
+    "  2: Hierarchical neighbourhood prediction as lifting transform")
+///*********************************************************///**************************************************///
+	("lambda",
+    params_attr.aps.lambda, 3,
+    "Controls the lambda of attribute predicted")
 
   ("rahtPredictionEnabled",
     params_attr.aps.raht_prediction_enabled_flag, true,
@@ -812,55 +1028,73 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Attribute's maximum number of nearest neighbors to be used for prediction")
 
   ("adaptivePredictionThreshold",
-    params_attr.aps.adaptive_prediction_threshold, -1,
-    "Neighbouring attribute value difference that enables choice of "
-    "single|multi predictors. Applies to transformType=2 only.\n"
-    "  -1: auto = 2**(bitdepth-2)")
+    params_attr.aps.adaptive_prediction_threshold, 1 << 6,
+    "Neighbouring attribute value difference that enables direct "
+    "prediction. 8-bit value scaled to attribute bitdeph. "
+    "Applies to transformType=0 only")
 
   ("intraLodSearchRange",
-    params_attr.aps.intra_lod_search_range, 0,
-    "Intra LoD nearest neighbor search range")
+    params_attr.aps.intra_lod_search_range, -1,
+    "Intra LoD nearest neighbor search range\n"
+    " -1: Full-range")
 
   ("interLodSearchRange",
-    params_attr.aps.inter_lod_search_range, 0,
-    "Inter LoD nearest neighbor search range")
+    params_attr.aps.inter_lod_search_range, -1,
+    "Inter LoD nearest neighbor search range\n"
+    " -1: Full-range")
 
   // NB: the underlying variable is in STV order.
   //     Conversion happens during argument sanitization.
   ("lod_neigh_bias",
     params_attr.aps.lodNeighBias, {1, 1, 1},
-    "Attribute's (x, y, z) component intra prediction weights")
+    "Attribute's (x,y,z) component intra prediction weights")
 
-  ("lodDecimation",
-    params_attr.aps.lod_decimation_enabled_flag, false,
-    "Controls LoD generation method:\n"
-    " 0: distance based subsampling\n"
-    " 1: periodic subsampling using lodSamplingPeriod")
+  ("lodDecimator",
+    params_attr.aps.lod_decimation_type, LodDecimationMethod::kNone,
+    "LoD decimation method:\n"
+    " 0: none\n"
+    " 1: periodic subsampling using lodSamplingPeriod\n"
+    " 2: centroid subsampling using lodSamplingPeriod")
 
   ("max_num_direct_predictors",
     params_attr.aps.max_num_direct_predictors, 3,
     "Maximum number of nearest neighbour candidates used in direct"
     "attribute prediction")
 
+  ("direct_avg_predictor_disabled_flag",
+    params_attr.aps.direct_avg_predictor_disabled_flag, false,
+    "Disable average predictor")
+
+  ("predWeightBlending",
+    params_attr.aps.pred_weight_blending_enabled_flag, false,
+    "Blend prediction weights according to neigbour distances. "
+    "Applies to transformType=0 only")
+
+  // NB: this parameter actually represents the number of refinement layers
   ("levelOfDetailCount",
-    params_attr.aps.num_detail_levels, 1,
+    params_attr.aps.num_detail_levels_minus1, 1,
     "Attribute's number of levels of detail")
 
   ("dist2",
     params_attr.aps.dist2, 0,
-    "Initial squared distance used in LoD generation.\n")
+    "Initial squared distance used in LoD generation")
 
   ("dist2PercentileEstimate",
     params_attr.encoder.dist2PercentileEstimate, 0.85f,
     "Percentile for dist2 estimation during nearest neighbour search")
 
+  ("positionQuantizationScaleAdjustsDist2",
+    params.positionQuantizationScaleAdjustsDist2, false,
+    "Scale dist2 values by squared positionQuantizationScale")
+
   ("lodSamplingPeriod",
     params_attr.aps.lodSamplingPeriod, {4},
-    "List of per LoD sampling periods used in LoD generation.\n")
+    "List of per LoD sampling periods used in LoD generation")
 
-  ("intraLodPredictionEnabled",
-    params_attr.aps.intra_lod_prediction_enabled_flag, false,
-    "Permits referring to points in same LoD")
+  ("intraLodPredictionSkipLayers",
+    params_attr.aps.intra_lod_prediction_skip_layers, -1,
+    "Number of finest detail levels that skip intra prediction\n"
+    " -1: skip all (disables intra pred)")
 
   ("interComponentPredictionEnabled",
     params_attr.aps.inter_component_prediction_enabled_flag, false,
@@ -879,12 +1113,17 @@ ParseParameters(int argc, char* argv[], Parameters& params)
      params_attr.aps.spherical_coord_flag, false,
      "Code attributes in spherical domain")
 
+  ("attrSphericalMaxLog2",
+    params.encoder.attrSphericalMaxLog2, 0,
+    "Override spherical coordinate normalisation factor")
+
   ("aps_scalable_enable_flag",
     params_attr.aps.scalable_lifting_enabled_flag, false,
     "Enable scalable attritube coding")
 
   ("max_neigh_range",
-    params_attr.aps.max_neigh_range, 5,
+    // NB: this is adjusted by minus 1 after the arguments are parsed
+    params_attr.aps.max_neigh_range_minus1, 5,
     "maximum nearest neighbour range for scalable lifting")
 
   ("qp",
@@ -907,6 +1146,10 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   ("qpLayerOffsetsChroma",
       params_attr.encoder.abh.attr_layer_qp_delta_chroma, {},
       "Attribute's per layer chroma QP offsets")
+
+  ("quantNeighWeight",
+    params_attr.aps.quant_neigh_weight, {16, 8, 4},
+    "Factors used to derive quantization weights (transformType=1)")
 
   // This section is just dedicated to attribute recolouring (encoder only).
   // parameters are common to all attributes.
@@ -981,20 +1224,107 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     return false;
   }
 
+  // set default output units (this works for the decoder too)
+  if (params.outputUnitLength <= 0.)
+    params.outputUnitLength = params.encoder.srcUnitLength;
+  params.encoder.outputFpBits = params.outputFpBits;
+  params.decoder.outputFpBits = params.outputFpBits;
+
+  if (!params.isDecoder)
+    sanitizeEncoderOpts(params, err);
+
+  // check required arguments are specified
+  if (!params.isDecoder && params.uncompressedDataPath.empty())
+    err.error() << "uncompressedDataPath not set\n";
+
+  if (params.isDecoder && params.reconstructedDataPath.empty())
+    err.error() << "reconstructedDataPath not set\n";
+
+  if (params.compressedStreamPath.empty())
+    err.error() << "compressedStreamPath not set\n";
+
+  // report the current configuration (only in the absence of errors so
+  // that errors/warnings are more obvious and in the same place).
+  if (err.is_errored)
+    return false;
+
+  // Dump the complete derived configuration
+  cout << "+ Effective configuration parameters\n";
+
+  po::dumpCfg(cout, opts, "General", 4);
+  if (params.isDecoder) {
+    po::dumpCfg(cout, opts, "Decoder", 4);
+  } else {
+    po::dumpCfg(cout, opts, "Coordinate system scaling", 4);
+    po::dumpCfg(cout, opts, "Encoder", 4);
+    po::dumpCfg(cout, opts, "Geometry", 4);
+    po::dumpCfg(cout, opts, "Recolouring", 4);
+
+    for (const auto& it : params.encoder.attributeIdxMap) {
+      // NB: when dumping the config, opts references params_attr
+      params_attr.desc = params.encoder.sps.attributeSets[it.second];
+      params_attr.aps = params.encoder.aps[it.second];
+      params_attr.encoder = params.encoder.attr[it.second];
+      cout << "    " << it.first << "\n";
+      po::dumpCfg(cout, opts, "Attributes", 8);
+    }
+  }
+
+  cout << endl;
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
+
+void
+sanitizeEncoderOpts(
+  Parameters& params, df::program_options_lite::ErrorReporter& err)
+{
+  // Input scaling affects the definition of the source unit length.
+  // eg, if the unit length of the source is 1m, scaling by 1000 generates
+  // a cloud with unit length 1mm.
+  params.encoder.srcUnitLength /= params.inputScale;
+
+  // global scale factor must be positive
+  if (params.encoder.codedGeomScale > params.encoder.seqGeomScale) {
+    err.warn() << "codingScale must be <= sequenceScale, adjusting\n";
+    params.encoder.codedGeomScale = params.encoder.seqGeomScale;
+  }
+
   // fix the representation of various options
   params.encoder.gbh.geom_stream_cnt_minus1--;
+  params.encoder.gps.geom_idcm_rate_minus1--;
+  params.encoder.gps.geom_angular_azimuth_speed_minus1--;
+  params.encoder.gps.neighbour_avail_boundary_log2_minus1 =
+    std::max(0, params.encoder.gps.neighbour_avail_boundary_log2_minus1 - 1);
+  for (auto& attr_sps : params.encoder.sps.attributeSets) {
+    attr_sps.params.attr_scale_minus1--;
+  }
   for (auto& attr_aps : params.encoder.aps) {
     attr_aps.init_qp_minus4 -= 4;
     attr_aps.num_pred_nearest_neighbours_minus1--;
+    attr_aps.max_neigh_range_minus1--;
   }
 
   // Config options are absolute, but signalling is relative
   params.encoder.gbh.geom_qp_offset_intvl_log2_delta -=
     params.encoder.gps.geom_qp_offset_intvl_log2;
 
-  // set default output resolution (this works for the decoder too)
-  if (params.outputResolution < 0)
-    params.outputResolution = params.encoder.srcResolution;
+  // If idcm rate is configured as 0, disable idcm
+  // NB: if user has requested less contrained idcm, warn
+  if (params.encoder.gps.geom_idcm_rate_minus1 < 0) {
+    if (params.encoder.gps.inferred_direct_coding_mode == 1)
+      params.encoder.gps.inferred_direct_coding_mode = 0;
+  }
+
+  if (params.encoder.gps.geom_idcm_rate_minus1 < 31) {
+    if (params.encoder.gps.inferred_direct_coding_mode > 1) {
+      params.encoder.gps.geom_idcm_rate_minus1 = 31;
+      err.warn() << "ignoring planarModeIdcmUse < 32: "
+                    "contradicts inferredDirectCodingMode > 1\n";
+    }
+  }
 
   // convert coordinate systems if the coding order is different from xyz
   convertXyzToStv(&params.encoder.sps);
@@ -1006,8 +1336,12 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   // sanity: don't enable if only node size is 0.
   // todo(df): this needs to take into account slices where it is disabled
   if (params.encoder.trisoupNodeSizesLog2.size() == 1)
-    if (!params.encoder.trisoupNodeSizesLog2[0])
+    if (params.encoder.trisoupNodeSizesLog2[0] < 2)
       params.encoder.trisoupNodeSizesLog2.clear();
+
+  for (auto trisoupNodeSizeLog2 : params.encoder.trisoupNodeSizesLog2)
+    if (trisoupNodeSizeLog2 < 2)
+      err.error() << "Trisoup node size must be greater than 1\n";
 
   params.encoder.gps.trisoup_enabled_flag =
     !params.encoder.trisoupNodeSizesLog2.empty();
@@ -1051,13 +1385,24 @@ ParseParameters(int argc, char* argv[], Parameters& params)
 
     // default values for attribute
     attr_sps.attr_instance_id = 0;
-    attr_sps.cicp_colour_primaries_idx = 2;
-    attr_sps.cicp_transfer_characteristics_idx = 2;
-    attr_sps.cicp_video_full_range_flag = true;
-    attr_sps.cicpParametersPresent = false;
-    attr_sps.source_attr_offset_log2 = 0;
-    attr_sps.source_attr_scale_log2 = 0;
-    attr_sps.scalingParametersPresent = false;
+    auto& attrMeta = attr_sps.params;
+    attrMeta.cicp_colour_primaries_idx = 2;
+    attrMeta.cicp_transfer_characteristics_idx = 2;
+    attrMeta.cicp_video_full_range_flag = true;
+    attrMeta.cicpParametersPresent = false;
+    attrMeta.attr_frac_bits = 0;
+    attrMeta.scalingParametersPresent = false;
+
+    // Enable scaling if a paramter has been set
+    //  - pre/post scaling is only currently supported for reflectance
+    attrMeta.scalingParametersPresent = attrMeta.attr_offset
+      || attrMeta.attr_scale_minus1 || attrMeta.attr_frac_bits;
+
+    // todo(df): remove this hack when scaling is generalised
+    if (it.first != "reflectance" && attrMeta.scalingParametersPresent) {
+      err.warn() << it.first << ": scaling not supported, disabling\n";
+      attrMeta.scalingParametersPresent = 0;
+    }
 
     if (it.first == "reflectance") {
       // Avoid wasting bits signalling chroma quant step size for reflectance
@@ -1065,7 +1410,7 @@ ParseParameters(int argc, char* argv[], Parameters& params)
       attr_enc.abh.attr_layer_qp_delta_chroma.clear();
 
       // There is no matrix for reflectace
-      attr_sps.cicp_matrix_coefficients_idx = ColourMatrix::kUnspecified;
+      attrMeta.cicp_matrix_coefficients_idx = ColourMatrix::kUnspecified;
       attr_sps.attr_num_dimensions_minus1 = 0;
       attr_sps.attributeLabel = KnownAttributeLabel::kReflectance;
     }
@@ -1073,30 +1418,27 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     if (it.first == "color") {
       attr_sps.attr_num_dimensions_minus1 = 2;
       attr_sps.attributeLabel = KnownAttributeLabel::kColour;
-      attr_sps.cicpParametersPresent = true;
+      attrMeta.cicpParametersPresent = true;
     }
 
-    // Derive the secondary bitdepth
-    // todo(df): this needs to be a command line argument
-    //  -- but there are a few edge cases to handle
-    attr_sps.bitdepthSecondary = attr_sps.bitdepth;
-
     // Assume that YCgCo is actually YCgCoR for now
-    if (attr_sps.cicp_matrix_coefficients_idx == ColourMatrix::kYCgCo)
-      attr_sps.bitdepthSecondary++;
+    // This requires an extra bit to represent chroma (luma will have a
+    // reduced range)
+    if (attrMeta.cicp_matrix_coefficients_idx == ColourMatrix::kYCgCo)
+      attr_sps.bitdepth++;
 
     // Extend the default attribute value to the correct width if present
-    if (!attr_sps.attr_default_value.empty())
-      attr_sps.attr_default_value.resize(
+    if (!attrMeta.attr_default_value.empty())
+      attrMeta.attr_default_value.resize(
         attr_sps.attr_num_dimensions_minus1 + 1,
-        attr_sps.attr_default_value.back());
+        attrMeta.attr_default_value.back());
 
     // In order to simplify specification of dist2 values, which are
     // depending on the scale of the coded point cloud, the following
     // adjust the dist2 values according to PQS.  The user need only
     // specify the unquantised PQS value.
     if (params.positionQuantizationScaleAdjustsDist2) {
-      auto delta = log2(params.encoder.geomPreScale);
+      auto delta = log2(params.encoder.codedGeomScale);
       attr_aps.dist2 =
         std::max(0, int32_t(std::round(attr_aps.dist2 + delta)));
     }
@@ -1104,29 +1446,24 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     // derive samplingPeriod values based on initial value
     if (
       !attr_aps.lodParametersPresent()
-      || !attr_aps.lod_decimation_enabled_flag) {
+      || (attr_aps.lod_decimation_type == LodDecimationMethod::kNone)) {
       attr_aps.lodSamplingPeriod.clear();
     } else if (!attr_aps.lodSamplingPeriod.empty()) {
       auto i = attr_aps.lodSamplingPeriod.size();
-      attr_aps.lodSamplingPeriod.resize(attr_aps.num_detail_levels);
+      attr_aps.lodSamplingPeriod.resize(attr_aps.num_detail_levels_minus1);
       // add any extra values as required
-      for (; i < attr_aps.num_detail_levels; i++)
+      for (; i < attr_aps.num_detail_levels_minus1; i++)
         attr_aps.lodSamplingPeriod[i] = attr_aps.lodSamplingPeriod[i - 1];
-    }
-
-    // Set default threshold based on bitdepth
-    if (attr_aps.adaptive_prediction_threshold == -1) {
-      attr_aps.adaptive_prediction_threshold = 1 << (attr_sps.bitdepth - 2);
     }
 
     if (attr_aps.attr_encoding == AttributeEncoding::kLiftingTransform) {
       attr_aps.adaptive_prediction_threshold = 0;
-      attr_aps.intra_lod_prediction_enabled_flag = false;
+      attr_aps.intra_lod_prediction_skip_layers = -1;
     }
 
     // For RAHT, ensure that the unused lod count = 0 (prevents mishaps)
     if (attr_aps.attr_encoding == AttributeEncoding::kRAHTransform) {
-      attr_aps.num_detail_levels = 0;
+      attr_aps.num_detail_levels_minus1 = 0;
       attr_aps.adaptive_prediction_threshold = 0;
     }
 
@@ -1141,41 +1478,46 @@ ParseParameters(int argc, char* argv[], Parameters& params)
 
   // convert floating point values of Lasers' Theta and H to fixed point
   if (params.encoder.gps.geom_angular_mode_enabled_flag) {
+    if (params.encoder.numLasers == 0)
+      err.error() << "numLasers must be at least 1\n";
+
     for (auto val : params.encoder.lasersTheta) {
       int one = 1 << 18;
-      params.encoder.gps.geom_angular_theta_laser.push_back(round(val * one));
+      params.encoder.gps.angularTheta.push_back(round(val * one));
     }
 
     for (auto val : params.encoder.lasersZ) {
       int one = 1 << 3;
-      auto scale = params.encoder.geomPreScale;
+      auto scale = params.encoder.codedGeomScale;
       if (params.encoder.gps.predgeom_enabled_flag)
-        scale = 1.;
+        scale = params.encoder.codedGeomScale / params.encoder.seqGeomScale;
 
-      params.encoder.gps.geom_angular_z_laser.push_back(
-        round(val * scale * one));
+      params.encoder.gps.angularZ.push_back(round(val * scale * one));
     }
 
-    if (
-      params.encoder.gps.geom_angular_theta_laser.size()
-      != params.encoder.numLasers)
+    if (params.encoder.gps.angularTheta.size() != params.encoder.numLasers)
       err.error() << "lasersZ.size() != numLasers\n";
 
-    if (
-      params.encoder.gps.geom_angular_z_laser.size()
-      != params.encoder.numLasers)
+    if (params.encoder.gps.angularZ.size() != params.encoder.numLasers)
       err.error() << "lasersTheta.size() != numLasers\n";
 
     if (
-      params.encoder.gps.geom_angular_num_phi_per_turn.size()
+      params.encoder.gps.angularNumPhiPerTurn.size()
       != params.encoder.numLasers)
       err.error() << "lasersNumPhiPerTurn.size() != numLasers\n";
 
     if (params.encoder.gps.qtbt_enabled_flag) {
       params.encoder.geom.qtbt.angularMaxNodeMinDimLog2ToSplitV =
-        std::max<int>(0, 8 + log2(params.encoder.geomPreScale));
+        std::max<int>(0, 8 + log2(params.encoder.codedGeomScale));
       params.encoder.geom.qtbt.angularMaxDiffToSplitZ =
-        std::max<int>(0, 1 + log2(params.encoder.geomPreScale));
+        std::max<int>(0, 1 + log2(params.encoder.codedGeomScale));
+    }
+
+    if (params.encoder.gps.predgeom_enabled_flag) {
+      auto& gps = params.encoder.gps;
+      int maxSpeed = 1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12);
+      if (params.encoder.gps.geom_angular_azimuth_speed_minus1 + 1 > maxSpeed)
+        err.error() << "positionAzimuthSpeed > max (" << maxSpeed << ")\n";
     }
   }
 
@@ -1194,10 +1536,26 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   if (params.encoder.gps.geom_qp_multiplier_log2 & ~3)
     err.error() << "positionQpMultiplierLog2 must be in the range 0..3\n";
 
-  if (
-    params.encoder.gps.planar_buffer_disabled_flag
-    && !params.encoder.gps.geom_angular_mode_enabled_flag)
-    err.error() << "planar buffer can only be disabled with angular mode\n";
+  if (!params.encoder.gps.geom_angular_mode_enabled_flag) {
+    if (params.encoder.gps.planar_buffer_disabled_flag) {
+      params.encoder.gps.planar_buffer_disabled_flag = 0;
+      err.warn() << "ignoring planarBufferDisabled without angularEnabled\n";
+    }
+  }
+
+  // The following featues depend upon the occupancy atlas
+  if (!params.encoder.gps.neighbour_avail_boundary_log2_minus1) {
+    if (params.encoder.gps.adjacent_child_contextualization_enabled_flag)
+      err.warn() << "ignoring adjacentChildContextualization when"
+                    " neighbourAvailBoundaryLog2=0\n";
+
+    if (params.encoder.gps.intra_pred_max_node_size_log2)
+      err.warn() << "ignoring intra_pred_max_node_size_log2 when"
+                    " neighbourAvailBoundaryLog2=0\n";
+
+    params.encoder.gps.adjacent_child_contextualization_enabled_flag = 0;
+    params.encoder.gps.intra_pred_max_node_size_log2 = 0;
+  }
 
   if (
     params.encoder.partition.sliceMaxPoints
@@ -1222,11 +1580,8 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     if (attr_sps.bitdepth > 16)
       err.error() << it.first << ".bitdepth must be less than 17\n";
 
-    if (attr_sps.bitdepthSecondary > 16)
-      err.error() << it.first << ".bitdepth_secondary must be less than 17\n";
-
     if (attr_aps.lodParametersPresent()) {
-      int lod = attr_aps.num_detail_levels;
+      int lod = attr_aps.num_detail_levels_minus1;
       if (lod > 255 || lod < 0) {
         err.error() << it.first
                     << ".levelOfDetailCount must be in the range [0,255]\n";
@@ -1245,14 +1600,14 @@ ParseParameters(int argc, char* argv[], Parameters& params)
 
       if (
         attr_aps.attr_encoding == AttributeEncoding::kPredictingTransform
-        && lod == 0 && attr_aps.intra_lod_prediction_enabled_flag == 0) {
+        && lod == 0 && attr_aps.intra_lod_prediction_skip_layers != 0) {
         err.error()
           << "when transformType == 0 (Pred) and levelOfDetailCount == 0, "
-             "intraLodPredictionEnabled must be 1\n";
+             "intraLodPredictionSkipLayers must be 0\n";
       }
 
       if (
-        attr_aps.lod_decimation_enabled_flag
+        (attr_aps.lod_decimation_type != LodDecimationMethod::kNone)
         && attr_aps.lodSamplingPeriod.empty()) {
         err.error() << it.first
                     << ".lodSamplingPeriod must contain at least one entry\n";
@@ -1277,15 +1632,17 @@ ParseParameters(int argc, char* argv[], Parameters& params)
       }
 
       if (attr_aps.scalable_lifting_enabled_flag) {
-        if (attr_aps.lod_decimation_enabled_flag) {
-          err.error() << it.first
-                      << ".lod_decimation_enabled_flag must be = 0 \n";
+        if (attr_aps.lod_decimation_type != LodDecimationMethod::kNone) {
+          err.error() << it.first << ".lod_decimation_type must be 0\n";
         }
 
         if (params.encoder.gps.trisoup_enabled_flag) {
           err.error() << it.first
-                      << "trisoup_enabled_flag must be disabled \n";
+                      << " trisoup_enabled_flag must be disabled\n";
         }
+
+        if (params.encoder.gps.geom_qp_multiplier_log2 != 3)
+          err.error() << it.first << " positionQpMultiplierLog2 must be 3\n";
       }
     }
 
@@ -1297,75 +1654,18 @@ ParseParameters(int argc, char* argv[], Parameters& params)
                   << ".qpChromaOffset must be in the range [-47,47]\n";
     }
   }
-
-  // check required arguments are specified
-
-  if (!params.isDecoder && params.uncompressedDataPath.empty())
-    err.error() << "uncompressedDataPath not set\n";
-
-  if (params.isDecoder && params.reconstructedDataPath.empty())
-    err.error() << "reconstructedDataPath not set\n";
-
-  if (params.compressedStreamPath.empty())
-    err.error() << "compressedStreamPath not set\n";
-
-  // report the current configuration (only in the absence of errors so
-  // that errors/warnings are more obvious and in the same place).
-  if (err.is_errored)
-    return false;
-
-  // Dump the complete derived configuration
-  cout << "+ Effective configuration parameters\n";
-
-  po::dumpCfg(cout, opts, "General", 4);
-  if (params.isDecoder) {
-    po::dumpCfg(cout, opts, "Decoder", 4);
-  } else {
-    po::dumpCfg(cout, opts, "Encoder", 4);
-    po::dumpCfg(cout, opts, "Geometry", 4);
-    po::dumpCfg(cout, opts, "Recolouring", 4);
-
-    for (const auto& it : params.encoder.attributeIdxMap) {
-      // NB: when dumping the config, opts references params_attr
-      params_attr.desc = params.encoder.sps.attributeSets[it.second];
-      params_attr.aps = params.encoder.aps[it.second];
-      params_attr.encoder = params.encoder.attr[it.second];
-      cout << "    " << it.first << "\n";
-      po::dumpCfg(cout, opts, "Attributes", 8);
-    }
-  }
-
-  cout << endl;
-
-  return true;
 }
 
 //============================================================================
 
-SequenceEncoder::SequenceEncoder(Parameters* params) : params(params)
+SequenceEncoder::SequenceEncoder(Parameters* params) : SequenceCodec(params)
 {
   // determine the naming (ordering) of ply properties
   _plyAttrNames.position =
     axisOrderToPropertyNames(params->encoder.sps.geometry_axis_order);
 
   // NB: this is the raw origin before the encoder tweaks it
-  _angularOrigin = params->encoder.gps.geomAngularOrigin;
-}
-
-//----------------------------------------------------------------------------
-
-double
-SequenceEncoder::outputScale(const SequenceParameterSet& sps)
-{
-  switch (sps.seq_geom_scale_unit_flag) {
-  case ScaleUnit::kPointsPerMetre:
-    // todo(df): warn if output resolution not specified?
-    return params->outputResolution > 0
-      ? params->outputResolution / sps.seq_geom_scale
-      : 1.;
-
-  case ScaleUnit::kDimensionless: return 1. / sps.seq_geom_scale;
-  }
+  _angularOrigin = params->encoder.gps.gpsAngularOrigin;
 }
 
 //----------------------------------------------------------------------------
@@ -1398,7 +1698,7 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
   std::string srcName{expandNum(params->uncompressedDataPath, frameNum)};
   PCCPointSet3 pointCloud;
   if (
-    !ply::read(srcName, _plyAttrNames, pointCloud)
+    !ply::read(srcName, _plyAttrNames, params->inputScale, pointCloud)
     || pointCloud.getPointCount() == 0) {
     cout << "Error: can't open input file!" << endl;
     return -1;
@@ -1426,26 +1726,17 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
   clock->start();
 
   if (params->convertColourspace)
-    convertFromGbr(params->encoder.sps, pointCloud);
+    convertFromGbr(params->encoder.sps.attributeSets, pointCloud);
 
-  if (params->reflectanceScale > 1 && pointCloud.hasReflectances()) {
-    const auto pointCount = pointCloud.getPointCount();
-    for (size_t i = 0; i < pointCount; ++i) {
-      int val = pointCloud.getReflectance(i) / params->reflectanceScale;
-      pointCloud.setReflectance(i, val);
-    }
-  }
+  scaleAttributesForInput(params->encoder.sps.attributeSets, pointCloud);
 
   // The reconstructed point cloud
-  std::unique_ptr<PCCPointSet3> reconPointCloud;
-  if (!params->reconstructedDataPath.empty()) {
-    reconPointCloud.reset(new PCCPointSet3);
-  }
+  CloudFrame recon;
+  auto* reconPtr = params->reconstructedDataPath.empty() ? nullptr : &recon;
 
   auto bytestreamLenFrameStart = bytestreamFile.tellp();
 
-  int ret = encoder.compress(
-    pointCloud, &params->encoder, this, reconPointCloud.get());
+  int ret = encoder.compress(pointCloud, &params->encoder, this, reconPtr);
   if (ret) {
     cout << "Error: can't compress point cloud!" << endl;
     return -1;
@@ -1453,31 +1744,12 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
 
   auto bytestreamLenFrameEnd = bytestreamFile.tellp();
   int frameLen = bytestreamLenFrameEnd - bytestreamLenFrameStart;
-
   std::cout << "Total frame size " << frameLen << " B" << std::endl;
 
   clock->stop();
 
-  if (!params->reconstructedDataPath.empty()) {
-    if (params->convertColourspace)
-      convertToGbr(params->encoder.sps, *reconPointCloud);
-
-    if (params->reflectanceScale > 1 && reconPointCloud->hasReflectances()) {
-      const auto pointCount = reconPointCloud->getPointCount();
-      for (size_t i = 0; i < pointCount; ++i) {
-        int val =
-          reconPointCloud->getReflectance(i) * params->reflectanceScale;
-        reconPointCloud->setReflectance(i, val);
-      }
-    }
-
-    std::string recName{expandNum(params->reconstructedDataPath, frameNum)};
-    auto plyScale = outputScale(params->encoder.sps);
-    auto plyOrigin = params->encoder.sps.seqBoundingBoxOrigin * plyScale;
-    ply::write(
-      *reconPointCloud, _plyAttrNames, plyScale, plyOrigin, recName,
-      !params->outputBinaryPly);
-  }
+  if (reconPtr)
+    writeOutputFrame(params->reconstructedDataPath, {}, recon, recon.cloud);
 
   return 0;
 }
@@ -1499,46 +1771,21 @@ SequenceEncoder::onPostRecolour(const PCCPointSet3& cloud)
     return;
   }
 
-  std::string plyName{expandNum(params->postRecolorPath, frameNum)};
-  auto plyScale = outputScale(params->encoder.sps);
-  auto plyOrigin = params->encoder.sps.seqBoundingBoxOrigin * plyScale;
-
-  // todo(df): stop the clock
-  if (!params->convertColourspace) {
-    ply::write(
-      cloud, _plyAttrNames, plyScale, plyOrigin, plyName,
-      !params->outputBinaryPly);
-    return;
-  }
-
+  // todo(df): don't allocate if conversion is not required
   PCCPointSet3 tmpCloud(cloud);
-  convertToGbr(params->encoder.sps, tmpCloud);
-  ply::write(
-    tmpCloud, _plyAttrNames, plyScale, plyOrigin, plyName,
-    !params->outputBinaryPly);
+  CloudFrame frame;
+  frame.setParametersFrom(params->encoder.sps, params->encoder.outputFpBits);
+  frame.cloud = cloud;
+  frame.frameNum = frameNum - params->firstFrameNum;
+
+  writeOutputFrame(params->postRecolorPath, {}, frame, tmpCloud);
 }
 
 //============================================================================
 
-SequenceDecoder::SequenceDecoder(const Parameters* params)
-  : params(params), decoder(params->decoder)
+SequenceDecoder::SequenceDecoder(Parameters* params)
+  : SequenceCodec(params), decoder(params->decoder)
 {}
-
-//----------------------------------------------------------------------------
-
-double
-SequenceDecoder::outputScale(const SequenceParameterSet& sps)
-{
-  switch (sps.seq_geom_scale_unit_flag) {
-  case ScaleUnit::kPointsPerMetre:
-    // todo(df): warn if output resolution not specified?
-    return params->outputResolution > 0
-      ? params->outputResolution / sps.seq_geom_scale
-      : 1.;
-
-  case ScaleUnit::kDimensionless: return 1. / sps.seq_geom_scale;
-  }
-}
 
 //----------------------------------------------------------------------------
 
@@ -1550,13 +1797,10 @@ SequenceDecoder::decompress(Stopwatch* clock)
     return -1;
   }
 
-  frameNum = params->firstFrameNum;
   this->clock = clock;
-
-  PayloadBuffer buf;
-
   clock->start();
 
+  PayloadBuffer buf;
   while (true) {
     PayloadBuffer* buf_ptr = &buf;
     readTlv(fin, &buf);
@@ -1586,59 +1830,92 @@ SequenceDecoder::decompress(Stopwatch* clock)
 //----------------------------------------------------------------------------
 
 void
-SequenceDecoder::onOutputCloud(
-  const SequenceParameterSet& sps, const PCCPointSet3& decodedPointCloud)
+SequenceDecoder::onOutputCloud(const CloudFrame& frame)
 {
+  clock->stop();
+
   // copy the point cloud in order to modify it according to the output options
-  PCCPointSet3 pointCloud(decodedPointCloud);
+  PCCPointSet3 pointCloud(frame.cloud);
+  writeOutputFrame(
+    params->reconstructedDataPath, params->preInvScalePath, frame, pointCloud);
+
+  clock->start();
+}
+
+//============================================================================
+
+double
+SequenceCodec::outputScale(const CloudFrame& frame) const
+{
+  switch (params->outputSystem) {
+  case OutputSystem::kConformance: return 1.;
+
+  case OutputSystem::kExternal:
+    // The scaling converts from the frame's unit length to configured output.
+    // In terms of specification this is the external coordinate system.
+    return frame.outputUnitLength / params->outputUnitLength;
+  }
+}
+
+//----------------------------------------------------------------------------
+
+Vec3<double>
+SequenceCodec::outputOrigin(const CloudFrame& frame) const
+{
+  switch (params->outputSystem) {
+  case OutputSystem::kConformance: return 0.;
+
+  case OutputSystem::kExternal: return frame.outputOrigin * outputScale(frame);
+  }
+}
+
+//----------------------------------------------------------------------------
+
+void
+SequenceCodec::writeOutputFrame(
+  const std::string& postInvScalePath,
+  const std::string& preInvScalePath,
+  const CloudFrame& frame,
+  PCCPointSet3& cloud)
+{
+  if (postInvScalePath.empty() && preInvScalePath.empty())
+    return;
+
+  scaleAttributesForOutput(frame.attrDesc, cloud);
 
   if (params->convertColourspace)
-    convertToGbr(sps, pointCloud);
-
-  if (params->reflectanceScale > 1 && pointCloud.hasReflectances()) {
-    const auto pointCount = pointCloud.getPointCount();
-    for (size_t i = 0; i < pointCount; ++i) {
-      int val = pointCloud.getReflectance(i) * params->reflectanceScale;
-      pointCloud.setReflectance(i, val);
-    }
-  }
+    convertToGbr(frame.attrDesc, cloud);
 
   // the order of the property names must be determined from the sps
   ply::PropertyNameMap attrNames;
-  attrNames.position = axisOrderToPropertyNames(sps.geometry_axis_order);
+  attrNames.position = axisOrderToPropertyNames(frame.geometry_axis_order);
+
+  // offset frame number
+  int frameNum = frame.frameNum + params->firstFrameNum;
 
   // Dump the decoded colour using the pre inverse scaled geometry
-  if (!params->preInvScalePath.empty()) {
-    std::string filename{expandNum(params->preInvScalePath, frameNum)};
-    ply::write(
-      pointCloud, attrNames, 1.0, 0.0, params->preInvScalePath,
-      !params->outputBinaryPly);
+  if (!preInvScalePath.empty()) {
+    std::string filename{expandNum(preInvScalePath, frameNum)};
+    ply::write(cloud, attrNames, 1.0, 0.0, filename, !params->outputBinaryPly);
   }
 
-  clock->stop();
-
-  auto plyScale = outputScale(sps);
-  auto plyOrigin = sps.seqBoundingBoxOrigin * plyScale;
-  std::string decName{expandNum(params->reconstructedDataPath, frameNum)};
+  auto plyScale = outputScale(frame) / (1 << frame.outputFpBits);
+  auto plyOrigin = outputOrigin(frame);
+  std::string decName{expandNum(postInvScalePath, frameNum)};
   if (!ply::write(
-        pointCloud, attrNames, plyScale, plyOrigin, decName,
+        cloud, attrNames, plyScale, plyOrigin, decName,
         !params->outputBinaryPly)) {
     cout << "Error: can't open output file!" << endl;
   }
-
-  clock->start();
-
-  // todo(df): frame number should be derived from the bitstream
-  frameNum++;
 }
 
 //============================================================================
 
 const AttributeDescription*
-findColourAttrDesc(const SequenceParameterSet& sps)
+findColourAttrDesc(const std::vector<AttributeDescription>& attrDescs)
 {
   // todo(df): don't assume that there is only one colour attribute in the sps
-  for (const auto& desc : sps.attributeSets) {
+  for (const auto& desc : attrDescs) {
     if (desc.attributeLabel == KnownAttributeLabel::kColour)
       return &desc;
   }
@@ -1648,18 +1925,20 @@ findColourAttrDesc(const SequenceParameterSet& sps)
 //----------------------------------------------------------------------------
 
 void
-convertToGbr(const SequenceParameterSet& sps, PCCPointSet3& cloud)
+convertToGbr(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud)
 {
-  const AttributeDescription* attrDesc = findColourAttrDesc(sps);
+  const AttributeDescription* attrDesc = findColourAttrDesc(attrDescs);
   if (!attrDesc)
     return;
 
-  switch (attrDesc->cicp_matrix_coefficients_idx) {
+  switch (attrDesc->params.cicp_matrix_coefficients_idx) {
   case ColourMatrix::kBt709: convertYCbCrBt709ToGbr(cloud); break;
 
   case ColourMatrix::kYCgCo:
     // todo(df): select YCgCoR vs YCgCo
-    convertYCgCoRToGbr(attrDesc->bitdepth, cloud);
+    // NB: bitdepth is the transformed bitdepth, not the source
+    convertYCgCoRToGbr(attrDesc->bitdepth - 1, cloud);
     break;
 
   default: break;
@@ -1669,22 +1948,105 @@ convertToGbr(const SequenceParameterSet& sps, PCCPointSet3& cloud)
 //----------------------------------------------------------------------------
 
 void
-convertFromGbr(const SequenceParameterSet& sps, PCCPointSet3& cloud)
+convertFromGbr(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud)
 {
-  const AttributeDescription* attrDesc = findColourAttrDesc(sps);
+  const AttributeDescription* attrDesc = findColourAttrDesc(attrDescs);
   if (!attrDesc)
     return;
 
-  switch (attrDesc->cicp_matrix_coefficients_idx) {
+  switch (attrDesc->params.cicp_matrix_coefficients_idx) {
   case ColourMatrix::kBt709: convertGbrToYCbCrBt709(cloud); break;
 
   case ColourMatrix::kYCgCo:
     // todo(df): select YCgCoR vs YCgCo
-    convertGbrToYCgCoR(attrDesc->bitdepth, cloud);
+    // NB: bitdepth is the transformed bitdepth, not the source
+    convertGbrToYCgCoR(attrDesc->bitdepth - 1, cloud);
     break;
 
   default: break;
   }
+}
+
+//============================================================================
+
+const AttributeDescription*
+findReflAttrDesc(const std::vector<AttributeDescription>& attrDescs)
+{
+  // todo(df): don't assume that there is only one in the sps
+  for (const auto& desc : attrDescs) {
+    if (desc.attributeLabel == KnownAttributeLabel::kReflectance)
+      return &desc;
+  }
+  return nullptr;
+}
+
+//----------------------------------------------------------------------------
+
+struct AttrFwdScaler {
+  template<typename T>
+  T operator()(const AttributeParameters& params, T val) const
+  {
+    int scale = params.attr_scale_minus1 + 1;
+    return ((val - params.attr_offset) << params.attr_frac_bits) / scale;
+  }
+};
+
+//----------------------------------------------------------------------------
+
+struct AttrInvScaler {
+  template<typename T>
+  T operator()(const AttributeParameters& params, T val) const
+  {
+    int scale = params.attr_scale_minus1 + 1;
+    return ((val * scale) >> params.attr_frac_bits) + params.attr_offset;
+  }
+};
+
+//----------------------------------------------------------------------------
+
+template<typename Op>
+void
+scaleAttributes(
+  const std::vector<AttributeDescription>& attrDescs,
+  PCCPointSet3& cloud,
+  Op scaler)
+{
+  // todo(df): extend this to other attributes
+  const AttributeDescription* attrDesc = findReflAttrDesc(attrDescs);
+  if (!attrDesc || !attrDesc->params.scalingParametersPresent)
+    return;
+
+  auto& params = attrDesc->params;
+
+  // Parameters present, but nothing to do
+  bool unityScale = !params.attr_scale_minus1 && !params.attr_frac_bits;
+  if (unityScale && !params.attr_offset)
+    return;
+
+  const auto pointCount = cloud.getPointCount();
+  for (size_t i = 0; i < pointCount; ++i) {
+    auto& val = cloud.getReflectance(i);
+    val = scaler(params, val);
+  }
+}
+
+//----------------------------------------------------------------------------
+
+void
+SequenceCodec::scaleAttributesForInput(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud)
+{
+  scaleAttributes(attrDescs, cloud, AttrFwdScaler());
+}
+
+//----------------------------------------------------------------------------
+
+void
+SequenceCodec::scaleAttributesForOutput(
+  const std::vector<AttributeDescription>& attrDescs, PCCPointSet3& cloud)
+{
+  scaleAttributes(attrDescs, cloud, AttrInvScaler());
 }
 
 //============================================================================
